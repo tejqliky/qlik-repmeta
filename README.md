@@ -138,25 +138,25 @@ Open **http://localhost:5173** in your browser.
 
 ## 📊 Database Schema Highlights
 
-- `dim_customer` – Customers  
-- `dim_server` – Servers  
-- `ingest_run` – Replicate ingestion runs  
-- `rep_database` / `rep_task` – Endpoints & tasks  
-- `qem_task_perf` – QEM TSV metrics  
-- `replicate_latest_release_cache` – Latest GA Replicate version (auto-cached)  
-- `endpoint_master_sources` / `endpoint_master_targets` – Master endpoint lists  
-- `endpoint_alias_map` – Canonical alias mapping  
+- `dim_customer` - Customers  
+- `dim_server` - Servers  
+- `ingest_run` - Replicate ingestion runs  
+- `rep_database` / `rep_task` - Endpoints & tasks  
+- `qem_task_perf` - QEM TSV metrics  
+- `replicate_latest_release_cache` - Latest GA Replicate version (auto-cached)  
+- `endpoint_master_sources` / `endpoint_master_targets` - Master endpoint lists  
+- `endpoint_alias_map` - Canonical alias mapping  
 
 ---
 
 ## 📝 Customer Technical Overview (.docx)
 
-- **Executive Summary** – KPI cards + posture vs. GA train  
-- **Customer Insights** – Null targets & duplicate endpoint configs  
-- **Environment & Inventory** – Server roll-up & last ingests  
-- **Coverage Matrix** – Source × Target  
-- **License Usage** – Licensed vs. used endpoints  
-- **Server Deep Dives** – Top pairs and metrics  
+- **Executive Summary** - KPI cards + posture vs. GA train  
+- **Customer Insights** - Null targets & duplicate endpoint configs  
+- **Environment & Inventory** - Server roll-up & last ingests  
+- **Coverage Matrix** - Source × Target  
+- **License Usage** - Licensed vs. used endpoints  
+- **Server Deep Dives** - Top pairs and metrics  
 
 ---
 
@@ -197,7 +197,7 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for details.
 
 ## 📄 License
 
-MIT License – see [LICENSE](LICENSE).
+MIT License - see [LICENSE](LICENSE).
 
 ---
 

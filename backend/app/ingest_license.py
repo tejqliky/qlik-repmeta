@@ -20,8 +20,8 @@ def parse_license_from_log(text: str) -> Tuple[bool,bool,List[str],List[str],str
     Returns: (all_sources, all_targets, sources_list, targets_list, raw_line)
     Grabs the 2nd `]I: Licensed to` line if present; else the first.
     Supports:
-      - "… all sources, all targets …"
-      - "… sources: (A,B), targets: (X,Y) …"
+      - "... all sources, all targets ..."
+      - "... sources: (A,B), targets: (X,Y) ..."
     """
     lines = [ln for ln in text.splitlines() if "]I:" in ln and "Licensed to " in ln]
     if not lines:

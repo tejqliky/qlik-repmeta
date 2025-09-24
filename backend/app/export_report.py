@@ -458,12 +458,12 @@ def _type_icon(pretty: str) -> str:
 
 def _version_badge(version: Optional[str]) -> str:
     if not version or version.strip() in ("", "-"):
-        return "—  ⚠️"
+        return "-  ⚠️"
     return version
 
 def _age_badge(dt: Optional[datetime]) -> str:
     if not dt:
-        return "—  ⚠️"
+        return "-  ⚠️"
     now = datetime.now(timezone.utc)
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
@@ -605,7 +605,7 @@ def _names_from_rows(rows: List[Dict[str, Any]], is_source: bool) -> set:
     return out
 
 def _wrap_join(items: List[str]) -> str:
-    return ", ".join(items) if items else "—"
+    return ", ".join(items) if items else "-"
 
 def _license_pill_table(doc: Document, title: str,
                         used: List[str], licensed_not_used: List[str], unlicensed_in_use: List[str]):
@@ -655,7 +655,7 @@ def _license_usage_section(doc: Document,
     ])
     doc.add_paragraph()
 
-    # Panels (sequential — avoids nested tables)
+    # Panels (sequential - avoids nested tables)
     _license_pill_table(doc, "Sources", sorted(used_src), src_not_used, src_unlicensed)
     doc.add_paragraph()
     _license_pill_table(doc, "Targets", sorted(used_tgt), tgt_not_used, tgt_unlicensed)
@@ -702,7 +702,7 @@ async def generate_summary_docx(customer_name: str, server_name: str) -> Tuple[b
         tgt_n = role_map.get("TARGET", 0)
 
     doc = Document()
-    _add_title(doc, "Qlik Replicate – Server Review")
+    _add_title(doc, "Qlik Replicate - Server Review")
     _add_text(doc, f"Customer: {customer_name}", size=10)
     _add_text(doc, f"Server: {server_name}", size=10)
     _add_text(doc, f"Run ID: {run_id}", size=10)
@@ -755,12 +755,12 @@ def _endpoint_mix_cards(doc: Document,
     for i in range(max_len):
         if i < len(src_items):
             s_label, s_n = src_items[i]
-            table.rows[i + 1].cells[0].text = f"{_type_icon(s_label)}  {s_label} — {_fmt_int(s_n)}"
+            table.rows[i + 1].cells[0].text = f"{_type_icon(s_label)}  {s_label} - {_fmt_int(s_n)}"
         else:
             table.rows[i + 1].cells[0].text = ""
         if i < len(tgt_items):
             t_label, t_n = tgt_items[i]
-            table.rows[i + 1].cells[1].text = f"{_type_icon(t_label)}  {t_label} — {_fmt_int(t_n)}"
+            table.rows[i + 1].cells[1].text = f"{_type_icon(t_label)}  {t_label} - {_fmt_int(t_n)}"
         else:
             table.rows[i + 1].cells[1].text = ""
 
@@ -827,9 +827,9 @@ async def generate_customer_report_docx(customer_name: str) -> Tuple[bytes, str]
             t = _parse_replicate_version_to_train(ver_str)
             if t and latest_train:
                 delta = _trains_behind(latest_train, t)
-                posture_map[sname] = (ver_str or "—", delta, _posture_label(delta))
+                posture_map[sname] = (ver_str or "-", delta, _posture_label(delta))
             else:
-                posture_map[sname] = (ver_str or "—", 999, _posture_label(999))
+                posture_map[sname] = (ver_str or "-", 999, _posture_label(999))
 
         # ---------- Repo totals ----------
         latest_repo_rows = await _all(
@@ -1109,7 +1109,7 @@ async def generate_customer_report_docx(customer_name: str) -> Tuple[bytes, str]
     rows = []
     for s in sorted(version_map.keys()):
         ver, last_repo = version_map.get(s, (None, None))
-        _, delta, label = posture_map.get(s, (ver or "—", 999, _posture_label(999)))
+        _, delta, label = posture_map.get(s, (ver or "-", 999, _posture_label(999)))
         rows.append((s, _version_badge(ver), _age_badge(last_repo), label))
     _add_table(doc, headers=headers, rows=rows, style="Light Shading Accent 3")
     doc.add_paragraph()
@@ -1118,7 +1118,7 @@ async def generate_customer_report_docx(customer_name: str) -> Tuple[bytes, str]
     _endpoint_mix_cards(doc, src_rows_used, tgt_rows_used, bool(src_rows_used and tgt_rows_used))
     doc.add_paragraph()
 
-    # License Usage – modern design (no nested tables)
+    # License Usage - modern design (no nested tables)
     _license_usage_section(
         doc,
         used_source_types, used_target_types,
@@ -1143,7 +1143,7 @@ async def generate_customer_report_docx(customer_name: str) -> Tuple[bytes, str]
                 beyond2.append((sname, ver_str, label))
         headers = ["Server", "Replicate", "Posture"]
         if not behind2 and not beyond2:
-            _add_text(doc, "All servers are within 0–1 train of latest GA. ✅", size=10, italic=True)
+            _add_text(doc, "All servers are within 0-1 train of latest GA. ✅", size=10, italic=True)
         else:
             if behind2:
                 _add_text(doc, "🟠 2 trains behind", size=10, bold=True)
@@ -1189,7 +1189,7 @@ async def generate_customer_report_docx(customer_name: str) -> Tuple[bytes, str]
         if tasks_null_tgt:
             _add_text(doc, "Tasks with missing Target Type", size=11, bold=True)
             headers = ["Server", "Task", "Target Endpoint"]
-            rows = [(r.get("server_name") or "—", r.get("task_name") or "—", r.get("target_name") or "—")
+            rows = [(r.get("server_name") or "-", r.get("task_name") or "-", r.get("target_name") or "-")
                     for r in tasks_null_tgt]
             _add_table(doc, headers=headers, rows=rows, style="Light Shading")
         else:
@@ -1311,10 +1311,10 @@ async def generate_customer_report_docx(customer_name: str) -> Tuple[bytes, str]
             rows = []
             for r in dup_eps:
                 rows.append((
-                    r.get("server_name") or "—",
-                    r.get("role") or "—",
-                    _pretty_type(r.get("db_settings_type") or "") or "—",
-                    ", ".join(r.get("endpoint_names") or []) or "—",
+                    r.get("server_name") or "-",
+                    r.get("role") or "-",
+                    _pretty_type(r.get("db_settings_type") or "") or "-",
+                    ", ".join(r.get("endpoint_names") or []) or "-",
                     _fmt_int(r.get("n")),
                 ))
             _add_table(doc, headers=headers, rows=rows, style="Light Shading Accent 2")
@@ -1332,7 +1332,7 @@ async def generate_customer_report_docx(customer_name: str) -> Tuple[bytes, str]
     rows = []
     for r in rollup_rows:
         sname = r.get("server_name")
-        ver_str, delta, label = posture_map.get(sname, ("—", 999, _posture_label(999)))
+        ver_str, delta, label = posture_map.get(sname, ("-", 999, _posture_label(999)))
         rows.append([
             sname,
             _fmt_int(r.get("tasks")),
