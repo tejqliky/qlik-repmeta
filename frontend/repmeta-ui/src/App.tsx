@@ -1,16 +1,10 @@
-import React, { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 
-/** Types */
 type Customer = { customer_id: number; customer_name: string };
 type Server = { server_id: number; server_name: string; environment?: string };
 
-/** ---- API base: force same-origin proxy in Docker/VM ---- */
-const DEFAULT_API = "/api";
-const configuredApi = (import.meta.env.VITE_API_BASE_URL ?? DEFAULT_API).trim();
-const API_BASE = (/^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?/i.test(configuredApi) ? DEFAULT_API : configuredApi)
-  .replace(/\/+$/, "");
+const API_BASE = import.meta.env.VITE_API_BASE_URL || "http://127.0.0.1:8002";
 
-/** ---- utils ---- */
 async function fetchJson<T>(url: string, init?: RequestInit): Promise<T> {
   const res = await fetch(url, init);
   if (!res.ok) {
@@ -42,128 +36,10 @@ function toast(msg: string, kind: "ok" | "err" = "ok") {
   setTimeout(() => el.remove(), 3200);
 }
 
-/** ---- small UI bits ---- */
-function StatCard({ label, value }: { label: string; value: any }) {
-  return (
-    <div className="rounded-xl border bg-white p-3">
-      <div className="text-xs text-slate-500">{label}</div>
-      <div className="text-xl font-semibold">{value ?? "-"}</div>
-    </div>
-  );
-}
-
-function Tip({
-  text,
-  children,
-  className = "",
-  side = "bottom",
-}: {
-  text: string;
-  children: React.ReactNode;
-  className?: string;
-  side?: "top" | "bottom";
-}) {
-  const [open, setOpen] = useState(false);
-  const pos =
-    side === "top"
-      ? "bottom-full mb-2 left-1/2 -translate-x-1/2"
-      : "-bottom-10 left-1/2 -translate-x-1/2";
-  return (
-    <span
-      className={`relative inline-flex ${className}`}
-      onMouseEnter={() => setOpen(true)}
-      onMouseLeave={() => setOpen(false)}
-      onFocus={() => setOpen(true)}
-      onBlur={() => setOpen(false)}
-    >
-      {children}
-      {open && (
-        <span
-          role="tooltip"
-          className={`absolute z-50 ${pos} whitespace-pre rounded-md bg-gray-900 px-2 py-1 text-xs text-white shadow-lg`}
-        >
-          {text}
-        </span>
-      )}
-    </span>
-  );
-}
-
-function HelpDrawer({ open, onClose }: { open: boolean; onClose: () => void }) {
-  return (
-    <div className={`fixed inset-0 z-50 ${open ? "pointer-events-auto" : "pointer-events-none"}`} aria-hidden={!open}>
-      {/* backdrop */}
-      <div
-        className={`absolute inset-0 bg-black/30 transition-opacity ${open ? "opacity-100" : "opacity-0"}`}
-        onClick={onClose}
-      />
-      {/* panel */}
-      <aside
-        className={`absolute right-0 top-0 h-full w-[520px] max-w-[95vw] transform bg-white shadow-2xl transition-transform ${
-          open ? "translate-x-0" : "translate-x-full"
-        }`}
-        aria-label="Quick User Guide"
-      >
-        <div className="flex items-center justify-between border-b px-5 py-3">
-          <h2 className="text-lg font-semibold">Quick User Guide</h2>
-          <button onClick={onClose} className="rounded p-2 hover:bg-gray-100" aria-label="Close">
-            ✕
-          </button>
-        </div>
-        <div className="prose max-w-none px-5 py-4">
-          <h3>TL;DR (Fast Path)</h3>
-          <ol>
-            <li>Add customer → <em>Add</em></li>
-            <li>Upload <strong>Repository JSON</strong> per server → <em>Upload &amp; Ingest</em></li>
-            <li>(If your QEM metrics file has no <code>Host</code>) Upload <strong>QEM Servers TSV</strong></li>
-            <li>Upload <strong>QEM Metrics TSV</strong></li>
-            <li>(Optional) Upload <strong>Replicate License Log</strong></li>
-            <li>Download <strong>Customer Technical Overview (.docx)</strong></li>
-          </ol>
-
-          <h3>Files &amp; Formats</h3>
-          <ul>
-            <li><strong>Repo JSON:</strong> parses servers, endpoints, tasks, settings.</li>
-            <li><strong>QEM Servers TSV:</strong> columns <code>Name</code> and <code>Host</code>.</li>
-            <li><strong>QEM Metrics TSV:</strong> per-row metrics, uses <code>Host</code> or the mapping above.</li>
-            <li><strong>License Log:</strong> parses the <code>]I: Licensed to ...</code> line for licensed sources/targets.</li>
-          </ul>
-
-          <h3>Troubleshooting</h3>
-          <ul>
-            <li><em>Failed to fetch / CORS:</em> open the site via the VM's IP/host; UI proxies API at <code>/api</code>.</li>
-            <li><em>Zeros in QEM tiles:</em> import Servers TSV first if Metrics TSV lacks <code>Host</code>.</li>
-            <li><em>Export issues:</em> ensure Repo JSON ingested and DB schema applied.</li>
-          </ul>
-
-          <div className="mt-6 rounded-lg bg-indigo-50 p-4">
-            <div className="font-semibold mb-1">Getting Started checklist</div>
-            <ul className="list-disc pl-5">
-              <li>Add a customer</li>
-              <li>Upload at least one Repository JSON</li>
-              <li>Import QEM Servers TSV (if needed)</li>
-              <li>Import QEM Metrics TSV</li>
-              <li>(Optional) Upload license log</li>
-              <li>Export the report</li>
-            </ul>
-          </div>
-
-          <p className="mt-4 text-sm text-slate-600">
-            API: <a className="text-indigo-600 underline" href="/api/docs" target="_blank" rel="noreferrer">/api/docs</a>
-          </p>
-        </div>
-      </aside>
-    </div>
-  );
-}
-
-/** ---- main component ---- */
 export default function App() {
   const [customers, setCustomers] = useState<Customer[]>([]);
   const [servers, setServers] = useState<Server[]>([]);
   const [customerId, setCustomerId] = useState<number | null>(null);
-  const [helpOpen, setHelpOpen] = useState(false);
-
   const customerName = useMemo(
     () => customers.find((c) => c.customer_id === customerId)?.customer_name ?? "",
     [customers, customerId]
@@ -189,52 +65,30 @@ export default function App() {
   const [deleteAlsoServers, setDeleteAlsoServers] = useState<boolean>(false);
   const [busy, setBusy] = useState(false);
 
-  // API health (derived from last customers fetch)
-  const [apiOk, setApiOk] = useState<boolean | null>(null);
+  // Help drawer
+  const [helpOpen, setHelpOpen] = useState(false);
 
-  /** helpers */
-  const clearFileInputs = () => {
-    if (repoFileRef.current) repoFileRef.current.value = "";
-    if (qemServersFileRef.current) qemServersFileRef.current.value = "";
-    if (qemFileRef.current) qemFileRef.current.value = "";
-    if (licenseFileRef.current) licenseFileRef.current.value = "";
-  };
+  // ---------- data loaders ----------
+  async function loadCustomers() {
+    const rows = await fetchJson<Customer[]>(`${API_BASE}/customers`);
+    setCustomers(rows.sort((a, b) => a.customer_name.localeCompare(b.customer_name)));
+    // auto-select when there is only one
+    if (rows.length === 1) setCustomerId(rows[0].customer_id);
+  }
 
-  const reloadCustomers = async () => {
-    try {
-      const rows = await fetchJson<Customer[]>(`${API_BASE}/customers`);
-      setCustomers(rows.sort((a, b) => a.customer_name.localeCompare(b.customer_name)));
-      setApiOk(true);
-      return rows;
-    } catch (e: any) {
-      setApiOk(false);
-      toast(`Load customers failed: ${e.message}`, "err");
-      throw e;
-    }
-  };
+  async function loadServers(cid: number) {
+    const rows = await fetchJson<Server[]>(`${API_BASE}/customers/${cid}/servers`);
+    setServers(rows);
+  }
 
-  /** Home: reset state & re-fetch */
-  const resetApp = async () => {
-    setBusy(false);
-    setCustomerId(null);
-    setNewCustomerName("");
-    setIngestMsg("");
-    setServersUpsertMsg("");
-    setQemSummary(null);
-    setLicenseSummary(null);
-    setServers([]);
-    clearFileInputs();
-    await reloadCustomers();
-    window.scrollTo({ top: 0, behavior: "smooth" });
-  };
-
-  /** effects */
   useEffect(() => {
     (async () => {
-      const rows = await reloadCustomers().catch(() => []);
-      if (rows.length === 1) setCustomerId(rows[0].customer_id);
+      try {
+        await loadCustomers();
+      } catch (e: any) {
+        toast(`Load customers failed: ${e.message}`, "err");
+      }
     })();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   useEffect(() => {
@@ -244,15 +98,40 @@ export default function App() {
         return;
       }
       try {
-        const rows = await fetchJson<Server[]>(`${API_BASE}/customers/${customerId}/servers`);
-        setServers(rows);
+        await loadServers(customerId);
       } catch (e: any) {
         toast(`Load servers failed: ${e.message}`, "err");
       }
     })();
   }, [customerId]);
 
-  /** actions */
+  // ---------- top bar actions ----------
+  async function handleHomeReset() {
+    try {
+      // clear file pickers
+      if (repoFileRef.current) repoFileRef.current.value = "";
+      if (qemServersFileRef.current) qemServersFileRef.current.value = "";
+      if (qemFileRef.current) qemFileRef.current.value = "";
+      if (licenseFileRef.current) licenseFileRef.current.value = "";
+
+      // clear UI state
+      setCustomerId(null);
+      setNewCustomerName("");
+      setIngestMsg("");
+      setServersUpsertMsg("");
+      setQemSummary(null);
+      setLicenseSummary(null);
+      setDeleteAlsoServers(false);
+
+      // reload customers fresh
+      await loadCustomers();
+      toast("Reset complete.", "ok");
+    } catch (e: any) {
+      toast(`Reset failed: ${e.message}`, "err");
+    }
+  }
+
+  // ---------- actions ----------
   async function handleAddCustomer() {
     const name = newCustomerName.trim();
     if (!name) return toast("Enter a customer name.", "err");
@@ -291,10 +170,7 @@ export default function App() {
         throw new Error(d);
       }
       setIngestMsg("Ingest complete.");
-      if (customerId) {
-        const rows = await fetchJson<Server[]>(`${API_BASE}/customers/${customerId}/servers`);
-        setServers(rows);
-      }
+      if (customerId) await loadServers(customerId);
       toast("Repository JSON ingested.", "ok");
     } catch (e: any) {
       setIngestMsg("");
@@ -320,12 +196,9 @@ export default function App() {
         try { const j = await res.json(); d = j?.detail ? j.detail : JSON.stringify(j); } catch {}
         throw new Error(d);
       }
-      const j = await res.json(); // { upserts, ... }
+      const j = await res.json(); // { rows, upserts, ... }
       setServersUpsertMsg(`Mappings upserted: ${j?.upserts ?? 0} row(s)`);
-      if (customerId) {
-        const rows = await fetchJson<Server[]>(`${API_BASE}/customers/${customerId}/servers`);
-        setServers(rows);
-      }
+      if (customerId) await loadServers(customerId);
       toast("Servers TSV ingested.", "ok");
     } catch (e: any) {
       toast(`Servers TSV ingest failed: ${e.message}`, "err");
@@ -379,10 +252,7 @@ export default function App() {
 
       setQemSummary({ ...totals, match_mode, details });
 
-      if (customerId) {
-        const rows = await fetchJson<Server[]>(`${API_BASE}/customers/${customerId}/servers`);
-        setServers(rows);
-      }
+      if (customerId) await loadServers(customerId);
       toast("QEM TSV ingested.", "ok");
     } catch (e: any) {
       toast(`QEM ingest failed: ${e.message}`, "err");
@@ -407,7 +277,7 @@ export default function App() {
         try { const j = await res.json(); d = j?.detail ? j.detail : JSON.stringify(j); } catch {}
         throw new Error(d);
       }
-      const j = await res.json(); // {licensed_all_sources, licensed_all_targets, licensed_sources, licensed_targets}
+      const j = await res.json();
       setLicenseSummary({
         all_sources: !!j?.licensed_all_sources,
         all_targets: !!j?.licensed_all_targets,
@@ -469,95 +339,42 @@ export default function App() {
     }
   }
 
-  /** ---- render ---- */
-  const showCustomerHint = customers.length > 0 && !customerId;
-  const noCustomers = customers.length === 0 && apiOk === true;
-
+  // ---------- UI ----------
   return (
     <div className="min-h-screen bg-slate-50">
-      {/* Top bar with Home / Refresh / API status / Docs / Help */}
-      <div className="bg-white border-b sticky top-0 z-40">
-        <div className="max-w-7xl mx-auto p-3 flex items-center gap-3 justify-between">
-          <div className="flex items-center gap-3">
-            <button
-              onClick={resetApp}
-              className="inline-flex items-center gap-2 px-3 h-10 rounded-xl border hover:bg-slate-50"
-              title="Reset view and reload customers"
-            >
-              <span>🏠</span>
-              <span className="font-medium">Home</span>
-            </button>
-            <button
-              onClick={reloadCustomers}
-              className="inline-flex items-center gap-2 px-3 h-10 rounded-xl border hover:bg-slate-50"
-              title="Refresh customers"
-            >
-              <span>↻</span>
-              <span className="font-medium">Refresh</span>
-            </button>
-            <span
-              className={`inline-flex items-center gap-2 px-3 h-10 rounded-xl text-sm ${
-                apiOk === true
-                  ? "bg-emerald-50 text-emerald-700 border border-emerald-200"
-                  : apiOk === false
-                  ? "bg-amber-50 text-amber-700 border border-amber-200"
-                  : "bg-slate-50 text-slate-600 border"
-              }`}
-              title="API connectivity based on last fetch"
-            >
-              <span
-                className={`inline-block w-2.5 h-2.5 rounded-full ${
-                  apiOk === true ? "bg-emerald-500" : apiOk === false ? "bg-amber-500" : "bg-slate-400"
-                }`}
-              />
-              <span className="font-medium">{apiOk === true ? "API OK" : apiOk === false ? "API issue" : "API..."}</span>
-            </span>
-          </div>
+      <header className="border-b bg-white">
+        <div className="max-w-7xl mx-auto p-4 flex items-center justify-between gap-3">
+          {/* Left: Home */}
           <div className="flex items-center gap-2">
-            <a
-              href="/api/docs"
-              target="_blank"
-              className="inline-flex items-center gap-2 px-3 h-10 rounded-xl border hover:bg-slate-50"
-              rel="noreferrer"
-              title="Open API Swagger in a new tab"
+            <button
+              onClick={handleHomeReset}
+              className="h-10 w-10 rounded-lg border hover:bg-slate-50"
+              aria-label="Home / Reset"
+              title="Home / Reset — clears file pickers and reloads customers"
             >
-              <span>📄</span>
-              <span className="font-medium">Docs</span>
-            </a>
+              <span className="text-xl leading-none">⌂</span>
+            </button>
+          </div>
+
+          {/* Center: Title */}
+          <div className="text-center">
+            <h1 className="text-2xl font-semibold">Qlik Replicate Metadata Console</h1>
+            <p className="text-slate-500 text-sm">
+              Ingest repository JSONs &amp; QEM TSVs, then export sleek Word reports.
+            </p>
+          </div>
+
+          {/* Right: Help */}
+          <div className="flex items-center gap-2">
             <button
               onClick={() => setHelpOpen(true)}
-              className="inline-flex items-center gap-2 px-3 h-10 rounded-xl bg-indigo-600 text-white hover:bg-indigo-700"
-              title="Open the Quick User Guide"
+              className="h-10 w-10 rounded-lg border hover:bg-slate-50"
+              aria-label="Help"
+              title="Help — Quick User Guide & Getting Started"
             >
-              <span>❔</span>
-              <span className="font-medium">Help</span>
+              <span className="text-xl leading-none">❔</span>
             </button>
           </div>
-        </div>
-      </div>
-
-      <header className="border-b bg-white">
-        <div className="max-w-7xl mx-auto p-4">
-          <h1 className="text-2xl font-semibold">Qlik Replicate Metadata Console</h1>
-          <p className="text-slate-500 text-sm">
-            Ingest repository JSONs &amp; QEM TSVs, then export sleek Word reports.
-          </p>
-          {/* Smart empty states */}
-          {apiOk === false && (
-            <div className="mt-3 rounded-xl border border-amber-200 bg-amber-50 p-3 text-sm text-amber-800">
-              API looks unreachable. Make sure you're opening the app via the VM's IP/host and that <code>/api</code> is proxied.
-            </div>
-          )}
-          {noCustomers && (
-            <div className="mt-3 rounded-xl border border-sky-200 bg-sky-50 p-3 text-sm text-sky-900">
-              No customers yet - add one below to get started.
-            </div>
-          )}
-          {showCustomerHint && (
-            <div className="mt-3 rounded-xl border border-indigo-200 bg-indigo-50 p-3 text-sm text-indigo-900">
-              Pick a customer from the dropdown after you add one to unlock uploads and export.
-            </div>
-          )}
         </div>
       </header>
 
@@ -567,7 +384,6 @@ export default function App() {
           <h3 className="text-sm font-semibold mb-2">Add customer</h3>
           <div className="flex flex-col sm:flex-row gap-3">
             <input
-              id="add-customer"
               type="text"
               placeholder="Enter customer name"
               value={newCustomerName}
@@ -578,6 +394,7 @@ export default function App() {
             <button
               onClick={handleAddCustomer}
               className="px-4 h-11 rounded-xl bg-indigo-600 text-white hover:bg-indigo-700"
+              title='Creates the customer record. Example: "Acme Corp"'
             >
               Add
             </button>
@@ -593,6 +410,7 @@ export default function App() {
                 className="w-full rounded-xl border-slate-300 focus:ring-2 focus:ring-indigo-500 h-11"
                 value={customerId ?? ""}
                 onChange={(e) => setCustomerId(e.target.value ? Number(e.target.value) : null)}
+                title="Pick a customer to associate ingests & reports"
               >
                 <option value="">Select...</option>
                 {customers.map((c) => (
@@ -604,16 +422,14 @@ export default function App() {
             </div>
 
             <div className="flex gap-3">
-              <Tip text={"Exports a modern Customer Technical Overview (.docx)\nusing the latest ingested data."}>
-                <button
-                  id="export-docx"
-                  onClick={downloadCustomerDocx}
-                  disabled={!customerName || busy}
-                  className="px-4 h-11 rounded-xl bg-violet-700 text-white hover:bg-violet-800 disabled:opacity-50"
-                >
-                  Download Customer Technical Overview (.docx)
-                </button>
-              </Tip>
+              <button
+                onClick={downloadCustomerDocx}
+                disabled={!customerName || busy}
+                className="px-4 h-11 rounded-xl bg-violet-700 text-white hover:bg-violet-800 disabled:opacity-50"
+                title="Exports the Customer Technical Overview (.docx)"
+              >
+                Download Customer Technical Overview (.docx)
+              </button>
             </div>
           </div>
 
@@ -653,16 +469,15 @@ export default function App() {
             Server is auto-detected from the file description (e.g. "Host name: USREM-HXT2, Time: ...").
           </p>
           <div className="flex flex-col items-start gap-3">
-            <input id="upload-repo-json" ref={repoFileRef} type="file" accept=".json" className="text-sm" />
-            <Tip text={"Qlik Replicate repository export (.json).\nParses servers, endpoints, tasks & settings."}>
-              <button
-                onClick={handleUploadRepoJson}
-                disabled={!customerName || busy}
-                className="px-4 h-11 rounded-xl bg-emerald-600 text-white hover:bg-emerald-700 disabled:opacity-50"
-              >
-                Upload &amp; Ingest
-              </button>
-            </Tip>
+            <input ref={repoFileRef} type="file" accept=".json" className="text-sm" />
+            <button
+              onClick={handleUploadRepoJson}
+              disabled={!customerName || busy}
+              className="px-4 h-11 rounded-xl bg-emerald-600 text-white hover:bg-emerald-700 disabled:opacity-50"
+              title='Accepts: *.json (Replicate Repository). Tip: ingest this before QEM to populate servers.'
+            >
+              Upload &amp; Ingest
+            </button>
           </div>
           {ingestMsg && <p className="mt-3 text-sm text-slate-600">{ingestMsg}</p>}
         </section>
@@ -677,16 +492,15 @@ export default function App() {
             without a <span className="font-mono">Host</span> column.
           </p>
           <div className="flex flex-col items-start gap-3">
-            <input id="upload-qem-servers" ref={qemServersFileRef} type="file" accept=".tsv,.txt" className="text-sm" />
-            <Tip text={"AemServers TSV mapping Name → Server and Host → Repo server.\nNeeded if Metrics TSV lacks Host."}>
-              <button
-                onClick={handleUploadQemServersTsv}
-                disabled={!customerName || busy}
-                className="px-4 h-11 rounded-xl bg-amber-600 text-white hover:bg-amber-700 disabled:opacity-50"
-              >
-                Upload Servers TSV
-              </button>
-            </Tip>
+            <input ref={qemServersFileRef} type="file" accept=".tsv,.txt" className="text-sm" />
+            <button
+              onClick={handleUploadQemServersTsv}
+              disabled={!customerName || busy}
+              className="px-4 h-11 rounded-xl bg-amber-600 text-white hover:bg-amber-700 disabled:opacity-50"
+              title='Accepts: AemServers_*.tsv. Purpose: provides Server→Host mapping for QEM rows that lack "Host". Upload this BEFORE QEM Metrics when Host is missing.'
+            >
+              Upload Servers TSV
+            </button>
           </div>
           {serversUpsertMsg && <p className="mt-3 text-sm text-slate-600">{serversUpsertMsg}</p>}
         </section>
@@ -699,16 +513,15 @@ export default function App() {
             Otherwise we resolve per row using the Servers mapping above (<em>Name → Host</em>).
           </p>
           <div className="flex flex-col items-start gap-3">
-            <input id="upload-qem-metrics" ref={qemFileRef} type="file" accept=".tsv,.txt" className="text-sm" />
-            <Tip text={"QEM per-task metrics TSV.\nUses Host if present, else the Name→Host mapping."}>
-              <button
-                onClick={handleUploadQemTsv}
-                disabled={!customerName || busy}
-                className="px-4 h-11 rounded-xl bg-sky-600 text-white hover:bg-sky-700 disabled:opacity-50"
-              >
-                Upload QEM
-              </button>
-            </Tip>
+            <input ref={qemFileRef} type="file" accept=".tsv,.txt" className="text-sm" />
+            <button
+              onClick={handleUploadQemTsv}
+              disabled={!customerName || busy}
+              className="px-4 h-11 rounded-xl bg-sky-600 text-white hover:bg-sky-700 disabled:opacity-50"
+              title='Accepts: QEM export TSV. Required columns: Server, Task, (Host or AemServers mapping). Upload AFTER "QEM Servers TSV" if Host is missing.'
+            >
+              Upload QEM
+            </button>
           </div>
 
           {qemSummary && (
@@ -758,16 +571,15 @@ export default function App() {
             <span className="font-mono">]I: Licensed to ...</span> line to detect licensed sources/targets.
           </p>
           <div className="flex flex-col items-start gap-3">
-            <input id="upload-license-log" ref={licenseFileRef} type="file" accept=".log,.txt" className="text-sm" />
-            <Tip text={"Any Replicate task log containing "]I: Licensed to ...".\nWe extract licensed sources/targets."}>
-              <button
-                onClick={handleUploadLicenseLog}
-                disabled={!customerName || busy}
-                className="px-4 h-11 rounded-xl bg-indigo-600 text-white hover:bg-indigo-700 disabled:opacity-50"
-              >
-                Upload License Log
-              </button>
-            </Tip>
+            <input ref={licenseFileRef} type="file" accept=".log,.txt" className="text-sm" />
+            <button
+              onClick={handleUploadLicenseLog}
+              disabled={!customerName || busy}
+              className="px-4 h-11 rounded-xl bg-indigo-600 text-white hover:bg-indigo-700 disabled:opacity-50"
+              title='Accepts: *.log or *.txt (Replicate task log). Optional — used to compute license coverage in the report.'
+            >
+              Upload License Log
+            </button>
           </div>
 
           {licenseSummary && (
@@ -775,23 +587,15 @@ export default function App() {
               <div className="font-medium mb-1">Detected license</div>
               <div>
                 Sources:&nbsp;
-                {licenseSummary.all_sources ? (
-                  <span>All</span>
-                ) : licenseSummary.sources?.length ? (
-                  licenseSummary.sources.join(", ")
-                ) : (
-                  "-"
-                )}
+                {licenseSummary.all_sources
+                  ? <span>All</span>
+                  : (licenseSummary.sources?.length ? licenseSummary.sources.join(", ") : "-")}
               </div>
               <div>
                 Targets:&nbsp;
-                {licenseSummary.all_targets ? (
-                  <span>All</span>
-                ) : licenseSummary.targets?.length ? (
-                  licenseSummary.targets.join(", ")
-                ) : (
-                  "-"
-                )}
+                {licenseSummary.all_targets
+                  ? <span>All</span>
+                  : (licenseSummary.targets?.length ? licenseSummary.targets.join(", ") : "-")}
               </div>
             </div>
           )}
@@ -806,6 +610,7 @@ export default function App() {
                 type="checkbox"
                 checked={deleteAlsoServers}
                 onChange={(e) => setDeleteAlsoServers(e.target.checked)}
+                title="Also drop the customer's server dimension rows (use with care)"
               />
               <span>Also drop this customer's servers</span>
             </label>
@@ -813,6 +618,7 @@ export default function App() {
               onClick={handleDeleteAll}
               disabled={!customerId || busy}
               className="px-4 h-11 rounded-xl bg-rose-600 text-white hover:bg-rose-700 disabled:opacity-50"
+              title="Deletes all ingested data for this customer (and optionally servers)."
             >
               Delete ingested data for customer
             </button>
@@ -820,8 +626,122 @@ export default function App() {
         </section>
       </main>
 
-      {/* Inline Quick User Guide */}
+      {/* Right-side Help Drawer */}
       <HelpDrawer open={helpOpen} onClose={() => setHelpOpen(false)} />
     </div>
+  );
+}
+
+function StatCard({ label, value }: { label: string; value: any }) {
+  return (
+    <div className="rounded-xl border bg-white p-3">
+      <div className="text-xs text-slate-500">{label}</div>
+      <div className="text-xl font-semibold">{value ?? "-"}</div>
+    </div>
+  );
+}
+
+/** Right-side drawer with Quick User Guide + Getting Started checklist */
+function HelpDrawer({ open, onClose }: { open: boolean; onClose: () => void }) {
+  return (
+    <>
+      {/* overlay */}
+      <div
+        className={`fixed inset-0 bg-black/30 transition-opacity ${open ? "opacity-100" : "opacity-0 pointer-events-none"}`}
+        onClick={onClose}
+        aria-hidden="true"
+      />
+
+      {/* panel */}
+      <aside
+        className={`fixed top-0 right-0 h-full w-full max-w-md bg-white shadow-2xl transition-transform duration-300
+        ${open ? "translate-x-0" : "translate-x-full"}`}
+        aria-label="Help drawer"
+      >
+        <div className="flex items-center justify-between p-4 border-b">
+          <div className="text-lg font-semibold">Quick User Guide</div>
+          <button
+            onClick={onClose}
+            className="h-9 w-9 rounded-lg border hover:bg-slate-50"
+            aria-label="Close"
+            title="Close"
+          >
+            <span className="text-xl leading-none">×</span>
+          </button>
+        </div>
+
+        <div className="p-4 space-y-6 overflow-y-auto h-[calc(100%-56px)]">
+          {/* TL;DR */}
+          <section>
+            <h4 className="font-semibold mb-2">TL;DR — Getting Started</h4>
+            <ol className="list-decimal list-inside space-y-1 text-sm text-slate-700">
+              <li>Add/select a customer.</li>
+              <li>Upload <span className="font-mono">Repository JSON</span> (autodetects server).</li>
+              <li>
+                Upload <span className="font-mono">QEM Servers TSV</span> <em>first</em> if your QEM export lacks a
+                <span className="font-mono"> Host</span> column.
+              </li>
+              <li>Upload <span className="font-mono">QEM Metrics TSV</span>.</li>
+              <li>(Optional) Upload a Replicate <span className="font-mono">task log</span> to extract license coverage.</li>
+              <li>Export the <strong>.docx</strong> Customer Technical Overview.</li>
+            </ol>
+          </section>
+
+          {/* Accepted files */}
+          <section>
+            <h4 className="font-semibold mb-2">Accepted files</h4>
+            <ul className="list-disc list-inside text-sm text-slate-700 space-y-1">
+              <li><strong>Repository JSON</strong>: *.json (Replicate repository export)</li>
+              <li><strong>QEM Servers</strong>: AemServers_*.tsv (columns: <em>Name</em>, <em>Host</em>)</li>
+              <li><strong>QEM Metrics</strong>: *.tsv (expects <em>Server</em>, <em>Task</em>, and either <em>Host</em> or Servers mapping)</li>
+              <li><strong>License Log</strong>: *.log or *.txt (look for <span className="font-mono">]I: Licensed to ...</span>)</li>
+            </ul>
+          </section>
+
+          {/* Ingestion order */}
+          <section>
+            <h4 className="font-semibold mb-2">Recommended ingestion order</h4>
+            <p className="text-sm text-slate-700">
+              Repository JSON → QEM Servers (if needed) → QEM Metrics → License Log (optional).
+            </p>
+          </section>
+
+          {/* Troubleshooting */}
+          <section>
+            <h4 className="font-semibold mb-2">Troubleshooting</h4>
+            <ul className="list-disc list-inside text-sm text-slate-700 space-y-1">
+              <li>If a QEM TSV lacks <em>Host</em>, upload the <strong>QEM Servers TSV</strong> first.</li>
+              <li>If the report is missing “Top-5 tasks by #tables”, re-ingest the <strong>Repository JSON</strong>.</li>
+              <li>Use the Home (⌂) button to clear file pickers and reload customers.</li>
+              <li>Check server logs for detailed errors; network failures are surfaced as toasts.</li>
+            </ul>
+          </section>
+
+          {/* API docs */}
+          <section>
+            <h4 className="font-semibold mb-2">API docs</h4>
+            <div className="text-sm space-y-1">
+              <a
+                href={`${API_BASE}/docs`}
+                target="_blank"
+                rel="noreferrer"
+                className="text-indigo-700 hover:underline"
+              >
+                Swagger UI (/docs)
+              </a>
+              <br />
+              <a
+                href={`${API_BASE}/redoc`}
+                target="_blank"
+                rel="noreferrer"
+                className="text-indigo-700 hover:underline"
+              >
+                ReDoc (/redoc)
+              </a>
+            </div>
+          </section>
+        </div>
+      </aside>
+    </>
   );
 }

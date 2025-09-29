@@ -390,3 +390,9 @@ $RECYCLE.BIN/
 # End of https://www.toptal.com/developers/gitignore/api/python,node,visualstudiocode,macos,windows
 "backend/.venv/" 
 "*.docx" 
+
+# Python caches
+__pycache__/
+*.pyc
+backend/app/__pycache__/
+

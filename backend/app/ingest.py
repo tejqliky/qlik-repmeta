@@ -2,7 +2,7 @@ import os
 import json
 import logging
 from datetime import datetime
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Set
 
 from psycopg.rows import dict_row
 
@@ -80,8 +80,6 @@ def _extract_replicate_version(payload: Dict[str, Any]) -> Optional[str]:
 # ------------------------------
 # Type → Family mapper
 # ------------------------------
-# We map raw db_settings["$type"] into a "family" + role-specific table name.
-# This keeps schema size manageable while still giving you per-endpoint tables.
 TYPE_TO_FAMILY: Dict[str, str] = {
     # PostgreSQL family (source)
     "PostgresqlsourceSettings": "postgresql",
@@ -176,7 +174,7 @@ TYPE_TO_FAMILY: Dict[str, str] = {
     "GooglestorageSettings": "gcs",
 
     # Google Dataproc
-    "DataprocSettings": "hadoop",  # goes with hadoop-like
+    "DataprocSettings": "hadoop",
 
     # Microsoft Fabric
     "FabricDataWarehouseSettings": "ms_fabric_dw",
@@ -286,7 +284,6 @@ async def _create_run(conn, customer_id: int, server_id: int, replicate_version:
     Creates an ingest run row. If the 'replicate_version' column exists, populate it.
     Falls back automatically if your schema doesn't have that column yet.
     """
-    # Try with replicate_version
     try:
         row = await (await conn.execute(
             f"""
@@ -300,7 +297,6 @@ async def _create_run(conn, customer_id: int, server_id: int, replicate_version:
     except Exception as e:
         LOG.debug("ingest_run.replicate_version not available; falling back. err=%s", e)
 
-    # Fallback without replicate_version (older schema)
     row = await (await conn.execute(
         f"""
         INSERT INTO {SCHEMA}.ingest_run (customer_id, server_id, created_at)
@@ -347,7 +343,6 @@ async def _detail_insert_or_json_fallback(conn, endpoint_id: int, role: str, typ
     table = _family_table(family, role)
     sjson = _json(dbs)
 
-    # If no dedicated table → send to JSON fallback
     if not table:
         await conn.execute(
             f"""INSERT INTO {SCHEMA}.rep_db_settings_json(endpoint_id, role, type_label, settings_json)
@@ -362,14 +357,12 @@ async def _detail_insert_or_json_fallback(conn, endpoint_id: int, role: str, typ
     cols: List[str] = []
     vals: List[Any] = []
 
-    # Family-specific extraction
     def add(col: str, value: Any):
         cols.append(col)
         vals.append(value)
 
     r = role.upper()
 
-    # Common candidates
     username = _first_str(dbs.get("username"))
     server = _first_str(dbs.get("server"))
     host = _first_str(dbs.get("host"))
@@ -573,11 +566,9 @@ async def _detail_insert_or_json_fallback(conn, endpoint_id: int, role: str, typ
         add("storage_account", _first_str(dbs.get("storageAccount")))
         add("container", _first_str(dbs.get("container")))
 
-    # Always include settings_json at the end
     cols.append("settings_json")
     vals.append(sjson)
 
-    # Build upsert
     col_list = ", ".join(cols)
     placeholders = ", ".join(["%s"] * len(vals))
     sql = f"""
@@ -593,7 +584,6 @@ async def _load_database_detail(conn, endpoint_id: int, role: str, settings: Dic
     type_label = settings.get("$type") or "Unknown"
     family = TYPE_TO_FAMILY.get(type_label)
     if not family:
-        # Unknown → dump whole object
         await conn.execute(
             f"""INSERT INTO {SCHEMA}.rep_db_settings_json(endpoint_id, role, type_label, settings_json)
                 VALUES (%s,%s,%s,%s)
@@ -610,7 +600,6 @@ async def _load_database_detail(conn, endpoint_id: int, role: str, settings: Dic
 # Tasks (link to endpoints)
 # ------------------------------
 async def _index_endpoints_by_name(conn, run_id: int) -> Dict[str, Dict[str, Any]]:
-    """Return {endpoint_name -> {endpoint_id, role, ...}} for quick linking."""
     cur = await conn.execute(
         f"SELECT endpoint_id, name, role FROM {SCHEMA}.rep_database WHERE run_id=%s",
         (run_id,)
@@ -623,12 +612,10 @@ async def _index_endpoints_by_name(conn, run_id: int) -> Dict[str, Dict[str, Any
 
 async def _insert_task(conn, run_id: int, customer_id: int, server_id: int, task_obj: Dict[str, Any]) -> int:
     task = task_obj.get("task") or {}
-
     name = task.get("name")
     task_type = task.get("task_type") or _first_str(task.get("type"), task.get("taskType"), "Unknown")
     source_name = task.get("source_name")
 
-    # Normalize targets to a Python list of strings (for text[] column)
     raw_targets = task.get("target_names") or task.get("targets") or []
     targets_list: List[str] = []
     if isinstance(raw_targets, list):
@@ -656,7 +643,6 @@ async def _insert_task(conn, run_id: int, customer_id: int, server_id: int, task
 
 
 async def _link_task_endpoints(conn, run_id: int, task_id: int, endpoints_by_name: Dict[str, Dict[str, Any]], source_name: Optional[str], target_names: List[str]):
-    # source (if present)
     if source_name and source_name in endpoints_by_name:
         src = endpoints_by_name[source_name]
         await conn.execute(
@@ -666,7 +652,6 @@ async def _link_task_endpoints(conn, run_id: int, task_id: int, endpoints_by_nam
             """,
             (task_id, src["endpoint_id"], run_id)
         )
-    # targets
     for tname in target_names or []:
         if tname and tname in endpoints_by_name:
             tgt = endpoints_by_name[tname]
@@ -680,6 +665,95 @@ async def _link_task_endpoints(conn, run_id: int, task_id: int, endpoints_by_nam
 
 
 # ------------------------------
+# FIXED: Persist explicit table list per task (correct path)
+# ------------------------------
+async def _insert_task_tables(conn, run_id: int, task_id: int, task_obj: Dict[str, Any]) -> None:
+    """
+    Extract explicit table list from a task and insert into rep_task_table.
+    Treat each (owner, name) pair as one table.
+
+    Robust JSON search:
+      - Look for 'source' at the top-level (task_obj['source']) and, if present,
+        scan that dict AND its 'rep_source' child (some repos nest here).
+      - Also tolerate the (rare) 'task' → 'source' nesting.
+
+      Within each candidate, read 'source_tables' (dict or list) and its
+      'explicit_included_tables' array of { owner, name, estimated_size, orig_db_id }.
+    """
+    if not isinstance(task_obj, dict):
+        return
+
+    # Where can 'source' live?
+    source_candidates: List[Dict[str, Any]] = []
+    if isinstance(task_obj.get("source"), dict):
+        source_candidates.append(task_obj["source"])        # common shape
+    if isinstance(task_obj.get("task"), dict) and isinstance(task_obj["task"].get("source"), dict):
+        source_candidates.append(task_obj["task"]["source"])  # rare shape
+
+    if not source_candidates:
+        return
+
+    seen: Set[Tuple[str, str]] = set()
+    rows: List[Tuple[int, int, str, str, Optional[float], Optional[int]]] = []
+
+    def _to_float(x):
+        try:
+            return float(x)
+        except Exception:
+            return None
+
+    def _to_int(x):
+        try:
+            return int(x)
+        except Exception:
+            return None
+
+    for src in source_candidates:
+        # IMPORTANT: 'source_tables' may be a sibling of 'rep_source' (not inside it),
+        # so we must check BOTH the src itself and its 'rep_source' child.
+        for holder in (src, src.get("rep_source") if isinstance(src.get("rep_source"), dict) else {}):
+            st = holder.get("source_tables")
+            groups: List[Dict[str, Any]] = []
+            if isinstance(st, dict):
+                groups = [st]
+            elif isinstance(st, list):
+                groups = [g for g in st if isinstance(g, dict)]
+
+            for g in groups:
+                arr = g.get("explicit_included_tables") or g.get("explicit_tables") or []
+                if not isinstance(arr, list):
+                    continue
+                for t in arr:
+                    if not isinstance(t, dict):
+                        continue
+                    owner = _first_str(t.get("owner"))
+                    name = _first_str(t.get("name"))
+                    if not owner or not name:
+                        continue
+                    key = (owner.strip(), name.strip())
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    est = _to_float(t.get("estimated_size"))
+                    orig = _to_int(t.get("orig_db_id"))
+                    rows.append((run_id, task_id, owner.strip(), name.strip(), est, orig))
+
+    if not rows:
+        return
+
+    sql = f"""
+        INSERT INTO {SCHEMA}.rep_task_table
+            (run_id, task_id, owner, table_name, estimated_size, orig_db_id)
+        VALUES (%s,%s,%s,%s,%s,%s)
+    """
+    inserted = 0
+    for r in rows:
+        await conn.execute(sql, r)
+        inserted += 1
+    LOG.debug("rep_task_table: task_id=%s -> inserted %s table rows", task_id, inserted)
+
+
+# ------------------------------
 # Public API
 # ------------------------------
 async def ingest_repository(repo_json: Dict[str, Any], customer_name: str, server_name: str) -> Dict[str, Any]:
@@ -688,13 +762,17 @@ async def ingest_repository(repo_json: Dict[str, Any], customer_name: str, serve
       - create ingest_run
       - flatten databases to rep_database + per-family detail tables (or JSON fallback)
       - flatten tasks, and link to endpoints by name
+      - persist per-task explicit tables to rep_task_table
     """
-    # Prefer the clean path-style lookup; keeps dotted key as harmless fallback
-    cmd = _get(repo_json, "cmd", "replication_definition") or _get(repo_json, "replication_definition") or _get(repo_json, "cmd.replication_definition") or {}
+    cmd = (
+        _get(repo_json, "cmd", "replication_definition")
+        or _get(repo_json, "replication_definition")
+        or _get(repo_json, "cmd.replication_definition")
+        or {}
+    )
     databases = cmd.get("databases") or []
     tasks = cmd.get("tasks") or []
 
-    # Extract Replicate version (e.g., "2025.5.0.308") from top-level _version.version
     replicate_version = _extract_replicate_version(repo_json)
     LOG.info("[INGEST] Starting ingest: customer=%s server=%s dbs=%s tasks=%s replicate_version=%s",
              customer_name, server_name, len(databases), len(tasks), replicate_version or "(none)")
@@ -705,34 +783,32 @@ async def ingest_repository(repo_json: Dict[str, Any], customer_name: str, serve
             customer_id = await _get_or_create_customer(conn, customer_name)
             server_id = await _get_or_create_server(conn, customer_id, server_name)
 
-            # Create run (stores replicate_version when column exists)
             run_id = await _create_run(conn, customer_id, server_id, replicate_version)
 
             # --- Databases
             endpoint_ids: List[int] = []
             for db in databases:
-                try:
-                    endpoint_id = await _insert_rep_database(conn, run_id, customer_id, server_id, db)
-                    endpoint_ids.append(endpoint_id)
-                    settings = db.get("db_settings") or {}
-                    role = (db.get("role") or "UNKNOWN").upper()
-                    await _load_database_detail(conn, endpoint_id, role, settings)
-                except Exception as e:
-                    LOG.exception("Failed to insert endpoint %s (%s): %s", db.get("name"), db.get("role"), e)
-                    raise
+                endpoint_id = await _insert_rep_database(conn, run_id, customer_id, server_id, db)
+                endpoint_ids.append(endpoint_id)
+                settings = db.get("db_settings") or {}
+                role = (db.get("role") or "UNKNOWN").upper()
+                await _load_database_detail(conn, endpoint_id, role, settings)
 
-            # --- Tasks + endpoint links
+            # --- Tasks + endpoint links + tables per task
             endpoints_by_name = await _index_endpoints_by_name(conn, run_id)
             task_ids: List[int] = []
             for obj in tasks:
                 task_id = await _insert_task(conn, run_id, customer_id, server_id, obj)
                 task_ids.append(task_id)
+
                 t = obj.get("task") or {}
                 source_name = t.get("source_name")
                 target_names = t.get("target_names") or []
                 await _link_task_endpoints(conn, run_id, task_id, endpoints_by_name, source_name, target_names)
 
-            # Finish
+                # capture explicit table list for this task (if present)
+                await _insert_task_tables(conn, run_id, task_id, obj)
+
             LOG.info("[INGEST] Completed run_id=%s endpoints=%s tasks=%s", run_id, len(endpoint_ids), len(task_ids))
             return {
                 "run_id": run_id,

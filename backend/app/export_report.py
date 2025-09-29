@@ -419,7 +419,7 @@ def _pretty_type(raw: Any) -> str:
         "Oracle": "Oracle (on-prem / Oracle Cloud)",
         "Snowflake": "Snowflake",
         "Bigquery": "Google BigQuery",
-        "Kafka": "Kafka",
+        "Kafka": "🧵",
         "Filechannel": "File Channel endpoint",
         "Mysql": "MySQL",
         "Db2": "IBM DB2 for LUW",
@@ -1080,6 +1080,43 @@ async def generate_customer_report_docx(customer_name: str) -> Tuple[bytes, str]
             for t in (lic_row.get("licensed_targets") or []):
                 lic_tgt.add(canonize_to_master(t, is_source=False))
 
+        # ---------- NEW: Top-5 tasks by #tables per server (precompute once) ----------
+        top_tables_by_server: Dict[str, List[Tuple[str, int]]] = defaultdict(list)
+        top_tables_rows = await _try_all(
+            conn,
+            f"""
+            WITH latest AS (
+              SELECT server_id, MAX(created_at) AS last_ingest
+              FROM {SCHEMA}.ingest_run
+              WHERE customer_id=%s
+              GROUP BY server_id
+            ),
+            counts AS (
+              SELECT r.server_id, t.task_name, COUNT(*) AS n_tables
+              FROM {SCHEMA}.rep_task_table tt
+              JOIN {SCHEMA}.rep_task t ON t.task_id = tt.task_id AND t.run_id = tt.run_id
+              JOIN {SCHEMA}.ingest_run r ON r.run_id = tt.run_id
+              JOIN latest l
+                ON l.server_id = r.server_id AND r.created_at = l.last_ingest
+              GROUP BY r.server_id, t.task_name
+            ),
+            ranked AS (
+              SELECT server_id, task_name, n_tables,
+                     ROW_NUMBER() OVER (PARTITION BY server_id ORDER BY n_tables DESC, task_name) AS rn
+              FROM counts
+            )
+            SELECT s.server_name, task_name, n_tables
+            FROM ranked rk
+            JOIN {SCHEMA}.dim_server s ON s.server_id = rk.server_id
+            WHERE rk.rn <= 5 AND s.customer_id = %s
+            ORDER BY s.server_name, n_tables DESC, task_name
+            """,
+            (customer_id, customer_id),
+        )
+        if top_tables_rows:
+            for r in top_tables_rows:
+                top_tables_by_server[r["server_name"]].append((r["task_name"], int(r["n_tables"])))
+
     # ---------------- DOCX BUILD ----------------
     doc = Document()
     _add_title(doc, "Customer Technical Overview")
@@ -1366,7 +1403,27 @@ async def generate_customer_report_docx(customer_name: str) -> Tuple[bytes, str]
         if pair:
             _add_text(doc, f"Primary pair: {_pretty_type(pair[0])} → {_pretty_type(pair[1])} ({_fmt_int(pair[2])} tasks)",
                       size=10, italic=True)
-        # Placeholder for future deep dives
+
+        # NEW: Top-5 tasks by number of tables for this server
+        top_rows = top_tables_by_server.get(s) or []
+        if top_rows:
+            last_repo_dt = (version_map.get(s) or (None, None))[1]
+            when_txt = ""
+            try:
+                if last_repo_dt:
+                    when_txt = f" (latest repo ingest: {last_repo_dt.date()})"
+            except Exception:
+                pass
+            _add_text(doc, f"Top-5 tasks by number of tables{when_txt}", size=11, bold=True)
+            _add_table(
+                doc,
+                headers=["Task", "# Tables"],
+                rows=[(name, _fmt_int(n)) for (name, n) in top_rows],
+                style="Light Shading Accent 1",
+            )
+        else:
+            _add_text(doc, "Top-5 tasks by number of tables — no table data found for latest ingest.", size=10, italic=True)
+
         doc.add_paragraph()
 
     # Index
