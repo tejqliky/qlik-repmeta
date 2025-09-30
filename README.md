@@ -203,7 +203,6 @@ MIT License - see [LICENSE](LICENSE).
 
 ## 🙌 Acknowledgments
 
-Built by Tej and collaborators at Qlik.  
 Inspired by real-world CSE needs to streamline Qlik Replicate platform reviews.
 
 ---
