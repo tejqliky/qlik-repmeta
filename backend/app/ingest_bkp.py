@@ -753,69 +753,6 @@ async def _insert_task_tables(conn, run_id: int, task_id: int, task_obj: Dict[st
     LOG.debug("rep_task_table: task_id=%s -> inserted %s table rows", task_id, inserted)
 
 
-async def _ensure_task_logger_table(conn) -> None:
-    """
-    Ensure the auxiliary table for task loggers exists.
-    No-op if it already exists or if privileges don't allow DDL.
-    """
-    try:
-        await conn.execute(f"""
-            CREATE TABLE IF NOT EXISTS {SCHEMA}.rep_task_logger (
-              task_id     BIGINT REFERENCES {SCHEMA}.rep_task(task_id) ON DELETE CASCADE,
-              run_id      BIGINT REFERENCES {SCHEMA}.ingest_run(run_id),
-              logger_name TEXT NOT NULL,
-              level       TEXT,
-              PRIMARY KEY (task_id, run_id, logger_name)
-            )
-        """)
-    except Exception as e:
-        LOG.debug("rep_task_logger table creation skipped (non-fatal): %s", e)
-
-async def _insert_task_loggers(conn, run_id: int, task_id: int, task_obj: Dict[str, Any]) -> None:
-    """
-    Flatten task.loggers into rep_task_logger (one row per logger per task per run).
-    Accept shapes:
-      - task_obj["loggers"] = { "TARGET_LOAD": "DEBUG", ... }
-      - task_obj["task"]["loggers"] = { ... }
-    Ignores keys: "$type", "loggers_configuration".
-    """
-    if not isinstance(task_obj, dict):
-        return
-
-    candidates = []
-    lg = task_obj.get("loggers")
-    if isinstance(lg, dict):
-        candidates.append(lg)
-    t = task_obj.get("task") or {}
-    if isinstance(t.get("loggers"), dict):
-        candidates.append(t["loggers"])
-
-    rows = []
-    for d in candidates:
-        for k, v in (d or {}).items():
-            if k in ("$type", "loggers_configuration"):
-                continue
-            if not isinstance(k, str):
-                continue
-            level = None if v is None else str(v)
-            rows.append((task_id, run_id, k.strip(), level.strip() if isinstance(level, str) else level))
-
-    if not rows:
-        return
-
-    # Ensure table exists (best-effort)
-    await _ensure_task_logger_table(conn)
-
-    sql = f"""INSERT INTO {SCHEMA}.rep_task_logger (task_id, run_id, logger_name, level)
-              VALUES (%s,%s,%s,%s)
-              ON CONFLICT (task_id, run_id, logger_name) DO UPDATE SET level=EXCLUDED.level"""
-    for r in rows:
-        try:
-            await conn.execute(sql, r)
-        except Exception as e:
-            LOG.debug("rep_task_logger insert skipped (non-fatal): %s / row=%s", e, r)
-
-
 # ------------------------------
 # Public API
 # ------------------------------
@@ -871,9 +808,6 @@ async def ingest_repository(repo_json: Dict[str, Any], customer_name: str, serve
 
                 # capture explicit table list for this task (if present)
                 await _insert_task_tables(conn, run_id, task_id, obj)
-
-                # capture logger levels for this task (if present)
-                await _insert_task_loggers(conn, run_id, task_id, obj)
 
             LOG.info("[INGEST] Completed run_id=%s endpoints=%s tasks=%s", run_id, len(endpoint_ids), len(task_ids))
             return {

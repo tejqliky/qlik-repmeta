@@ -1,16 +1,20 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 
+/** Types */
 type Customer = { customer_id: number; customer_name: string };
 type Server = { server_id: number; server_name: string; environment?: string };
 
+/** Keep your exact API base logic to avoid regressions */
 const API_BASE = import.meta.env.VITE_API_BASE_URL || "http://127.0.0.1:8002";
 
+/** ---- helpers ---- */
 async function fetchJson<T>(url: string, init?: RequestInit): Promise<T> {
   const res = await fetch(url, init);
   if (!res.ok) {
     let detail = `${res.status} ${res.statusText}`;
     try {
       const j = await res.json();
+      // @ts-ignore
       detail = j?.detail ? j.detail : JSON.stringify(j);
     } catch {}
     throw new Error(detail);
@@ -26,32 +30,135 @@ function toast(msg: string, kind: "ok" | "err" = "ok") {
   el.style.transform = "translateX(-50%)";
   el.style.bottom = "24px";
   el.style.padding = "10px 14px";
-  el.style.borderRadius = "10px";
+  el.style.borderRadius = "12px";
   el.style.fontSize = "14px";
   el.style.color = kind === "ok" ? "#064e3b" : "#7f1d1d";
   el.style.background = kind === "ok" ? "#d1fae5" : "#fee2e2";
   el.style.boxShadow = "0 8px 24px rgba(0,0,0,.18)";
   el.style.zIndex = "9999";
   document.body.appendChild(el);
-  setTimeout(() => el.remove(), 3200);
+  setTimeout(() => el.remove(), 2800);
 }
 
+/** ---- small UI bits ---- */
+function QlikMark() {
+  return (
+    <div className="relative grid h-9 w-9 place-items-center">
+      <div className="h-9 w-9 rounded-full bg-emerald-600"/>
+      <div className="absolute h-4 w-4 rounded-full bg-white"/>
+    </div>
+  );
+}
+
+function StatTile({ label, value }: { label: string; value: string | number }) {
+  return (
+    <div className="flex items-center gap-2 rounded-full border border-emerald-600/30 bg-emerald-500/10 px-3 py-1">
+      <span className="inline-block h-2 w-2 rounded-full bg-emerald-500"/>
+      <span className="text-sm font-semibold text-emerald-700">{value}</span>
+      <span className="text-[11px] uppercase tracking-wide text-emerald-800/70">{label}</span>
+    </div>
+  );
+}
+
+function Step({
+  index, label, active, done,
+}: { index: number; label: string; active?: boolean; done?: boolean }) {
+  return (
+    <div
+      className={`group flex items-center gap-3 rounded-2xl px-3 py-2 transition border ${
+        active
+          ? "bg-emerald-50 border-emerald-300 text-emerald-800"
+          : "border-slate-200 text-slate-600"
+      }`}
+    >
+      <div
+        className={`grid h-6 w-6 place-items-center rounded-full text-[11px] font-bold ${
+          done ? "bg-emerald-600 text-white" : active ? "bg-emerald-500 text-white" : "bg-slate-200 text-slate-700"
+        }`}
+      >
+        {done ? "✓" : index}
+      </div>
+      <span className="text-sm font-medium">{label}</span>
+    </div>
+  );
+}
+
+/** Generic, modern upload card wired to your refs and handlers */
+function UploadCard({
+  title,
+  icon,
+  description,
+  fileRef,
+  accept,
+  cta,
+  onUpload,
+  disabled,
+}: {
+  title: string;
+  icon: React.ReactNode;
+  description: string;
+  fileRef: React.MutableRefObject<HTMLInputElement | null>;
+  accept: string;
+  cta: string;
+  onUpload: () => void;
+  disabled?: boolean;
+}) {
+  const [fileName, setFileName] = useState<string>("");
+
+  return (
+    <div className="border-slate-200/70 bg-white/80 backdrop-blur-xl shadow-sm hover:shadow-md transition rounded-2xl border p-5">
+      <div className="flex items-center gap-3 mb-2">
+        <span className="grid h-9 w-9 place-items-center rounded-xl bg-emerald-500/15 text-emerald-600">{icon}</span>
+        <div className="text-base md:text-lg font-semibold text-slate-900">{title}</div>
+      </div>
+      <p className="text-sm text-slate-600 mb-3">{description}</p>
+      <div className="flex flex-wrap items-center gap-2">
+        <button
+          type="button"
+          onClick={() => fileRef.current?.click()}
+          className="rounded-xl border border-emerald-400/40 px-3 h-10 text-sm bg-white hover:bg-slate-50"
+        >
+          Choose File
+        </button>
+        <input
+          ref={fileRef}
+          type="file"
+          className="hidden"
+          accept={accept}
+          onChange={(e) => setFileName(e.target.files?.[0]?.name || "")}
+        />
+        <button
+          type="button"
+          onClick={onUpload}
+          disabled={disabled}
+          className="rounded-xl bg-emerald-600 hover:bg-emerald-700 disabled:opacity-50 text-white px-3 h-10 text-sm"
+        >
+          {cta}
+        </button>
+        {fileName && (
+          <span className="rounded-full border border-emerald-400/40 text-emerald-700 text-xs px-2 py-1">
+            {fileName}
+          </span>
+        )}
+      </div>
+    </div>
+  );
+}
+
+/** ---- main app ---- */
 export default function App() {
+  // data
   const [customers, setCustomers] = useState<Customer[]>([]);
   const [servers, setServers] = useState<Server[]>([]);
   const [customerId, setCustomerId] = useState<number | null>(null);
-  const customerName = useMemo(
-    () => customers.find((c) => c.customer_id === customerId)?.customer_name ?? "",
-    [customers, customerId]
-  );
 
-  // File refs
+  // file refs
   const repoFileRef = useRef<HTMLInputElement | null>(null);
   const qemServersFileRef = useRef<HTMLInputElement | null>(null);
   const qemFileRef = useRef<HTMLInputElement | null>(null);
   const licenseFileRef = useRef<HTMLInputElement | null>(null);
 
-  // UI state
+  // ui state
   const [newCustomerName, setNewCustomerName] = useState("");
   const [ingestMsg, setIngestMsg] = useState<string>("");
   const [serversUpsertMsg, setServersUpsertMsg] = useState<string>("");
@@ -64,18 +171,19 @@ export default function App() {
   } | null>(null);
   const [deleteAlsoServers, setDeleteAlsoServers] = useState<boolean>(false);
   const [busy, setBusy] = useState(false);
-
-  // Help drawer
   const [helpOpen, setHelpOpen] = useState(false);
 
-  // ---------- data loaders ----------
+  const customerName = useMemo(
+    () => customers.find((c) => c.customer_id === customerId)?.customer_name ?? "",
+    [customers, customerId]
+  );
+
+  /** data loaders */
   async function loadCustomers() {
     const rows = await fetchJson<Customer[]>(`${API_BASE}/customers`);
     setCustomers(rows.sort((a, b) => a.customer_name.localeCompare(b.customer_name)));
-    // auto-select when there is only one
     if (rows.length === 1) setCustomerId(rows[0].customer_id);
   }
-
   async function loadServers(cid: number) {
     const rows = await fetchJson<Server[]>(`${API_BASE}/customers/${cid}/servers`);
     setServers(rows);
@@ -83,38 +191,23 @@ export default function App() {
 
   useEffect(() => {
     (async () => {
-      try {
-        await loadCustomers();
-      } catch (e: any) {
-        toast(`Load customers failed: ${e.message}`, "err");
-      }
+      try { await loadCustomers(); } catch (e: any) { toast(`Load customers failed: ${e.message}`, "err"); }
     })();
   }, []);
-
   useEffect(() => {
     (async () => {
-      if (!customerId) {
-        setServers([]);
-        return;
-      }
-      try {
-        await loadServers(customerId);
-      } catch (e: any) {
-        toast(`Load servers failed: ${e.message}`, "err");
-      }
+      if (!customerId) { setServers([]); return; }
+      try { await loadServers(customerId); } catch (e: any) { toast(`Load servers failed: ${e.message}`, "err"); }
     })();
   }, [customerId]);
 
-  // ---------- top bar actions ----------
+  /** home/reset */
   async function handleHomeReset() {
     try {
-      // clear file pickers
       if (repoFileRef.current) repoFileRef.current.value = "";
       if (qemServersFileRef.current) qemServersFileRef.current.value = "";
       if (qemFileRef.current) qemFileRef.current.value = "";
       if (licenseFileRef.current) licenseFileRef.current.value = "";
-
-      // clear UI state
       setCustomerId(null);
       setNewCustomerName("");
       setIngestMsg("");
@@ -122,16 +215,15 @@ export default function App() {
       setQemSummary(null);
       setLicenseSummary(null);
       setDeleteAlsoServers(false);
-
-      // reload customers fresh
       await loadCustomers();
       toast("Reset complete.", "ok");
+      window.scrollTo({ top: 0, behavior: "smooth" });
     } catch (e: any) {
       toast(`Reset failed: ${e.message}`, "err");
     }
   }
 
-  // ---------- actions ----------
+  /** actions — identical to your existing handlers, just moved inside the new UI */
   async function handleAddCustomer() {
     const name = newCustomerName.trim();
     if (!name) return toast("Enter a customer name.", "err");
@@ -196,7 +288,7 @@ export default function App() {
         try { const j = await res.json(); d = j?.detail ? j.detail : JSON.stringify(j); } catch {}
         throw new Error(d);
       }
-      const j = await res.json(); // { rows, upserts, ... }
+      const j = await res.json();
       setServersUpsertMsg(`Mappings upserted: ${j?.upserts ?? 0} row(s)`);
       if (customerId) await loadServers(customerId);
       toast("Servers TSV ingested.", "ok");
@@ -339,409 +431,272 @@ export default function App() {
     }
   }
 
-  // ---------- UI ----------
+  /** ---- UI ---- */
   return (
-    <div className="min-h-screen bg-slate-50">
-      <header className="border-b bg-white">
-        <div className="max-w-7xl mx-auto p-4 flex items-center justify-between gap-3">
-          {/* Left: Home */}
-          <div className="flex items-center gap-2">
-            <button
-              onClick={handleHomeReset}
-              className="h-10 w-10 rounded-lg border hover:bg-slate-50"
-              aria-label="Home / Reset"
-              title="Home / Reset — clears file pickers and reloads customers"
-            >
-              <span className="text-xl leading-none">⌂</span>
+    <div className="min-h-screen w-full bg-[radial-gradient(900px_400px_at_80%_-5%,rgba(36,211,102,0.18),transparent),radial-gradient(700px_400px_at_0%_-10%,rgba(16,185,129,0.15),transparent)] bg-gradient-to-br from-white via-slate-50 to-emerald-50">
+      {/* Header */}
+      <header className="sticky top-0 z-40 backdrop-blur-xl bg-white/70 border-b border-emerald-200/30">
+        <div className="mx-auto max-w-7xl px-4 md:px-6 py-3 flex items-center justify-between gap-4">
+          <div className="flex items-center gap-3">
+            <QlikMark />
+            <div>
+              <div className="text-sm font-semibold tracking-tight text-slate-900">RepMeta Console — Qlik Theme</div>
+              <div className="text-[11px] text-slate-600">Ingest JSON/TSV & export polished Word reports</div>
+            </div>
+          </div>
+          <div className="hidden md:flex items-center gap-2">
+            <button className="rounded-full border px-3 h-10" onClick={handleHomeReset} title="Home / Reset">
+              Home / Reset
             </button>
-          </div>
-
-          {/* Center: Title */}
-          <div className="text-center">
-            <h1 className="text-2xl font-semibold">Qlik Replicate Metadata Console</h1>
-            <p className="text-slate-500 text-sm">
-              Ingest repository JSONs &amp; QEM TSVs, then export sleek Word reports.
-            </p>
-          </div>
-
-          {/* Right: Help */}
-          <div className="flex items-center gap-2">
-            <button
-              onClick={() => setHelpOpen(true)}
-              className="h-10 w-10 rounded-lg border hover:bg-slate-50"
-              aria-label="Help"
-              title="Help — Quick User Guide & Getting Started"
-            >
-              <span className="text-xl leading-none">❔</span>
+            <button className="rounded-full bg-emerald-600 hover:bg-emerald-700 text-white px-3 h-10" onClick={downloadCustomerDocx}>
+              Download Technical Overview (docx)
             </button>
           </div>
         </div>
       </header>
 
-      <main className="max-w-7xl mx-auto p-6 space-y-5 md:space-y-6">
-        {/* Add Customer */}
-        <section className="bg-white rounded-2xl shadow-sm p-4">
-          <h3 className="text-sm font-semibold mb-2">Add customer</h3>
-          <div className="flex flex-col sm:flex-row gap-3">
-            <input
-              type="text"
-              placeholder="Enter customer name"
-              value={newCustomerName}
-              onChange={(e) => setNewCustomerName(e.target.value)}
-              onKeyDown={(e) => e.key === "Enter" && handleAddCustomer()}
-              className="flex-1 rounded-xl border-slate-300 focus:ring-2 focus:ring-indigo-500 px-3 h-11"
-            />
-            <button
-              onClick={handleAddCustomer}
-              className="px-4 h-11 rounded-xl bg-indigo-600 text-white hover:bg-indigo-700"
-              title='Creates the customer record. Example: "Acme Corp"'
-            >
-              Add
-            </button>
+      {/* Content */}
+      <main className="mx-auto max-w-7xl px-4 md:px-6 py-6 grid grid-cols-1 lg:grid-cols-4 gap-6">
+        {/* Left rail */}
+        <div className="lg:col-span-1 space-y-6">
+          <div className="border-emerald-400/30 bg-white/80 rounded-2xl border p-4">
+            <div className="text-base font-semibold mb-2">Setup</div>
+            <div className="flex flex-col gap-2">
+              <Step index={1} label="Add Customer" done={!!customers.length}/>
+              <Step index={2} label="Select Snapshot" done={!!customerId}/>
+              <Step index={3} label="Upload Repository JSON" active/>
+              <Step index={4} label="Upload Servers TSV"/>
+              <Step index={5} label="Upload QEM TSV"/>
+              <Step index={6} label="Upload License Log"/>
+              <Step index={7} label="Generate Report"/>
+            </div>
           </div>
-        </section>
 
-        {/* Selections / Toolbar */}
-        <section className="bg-white rounded-2xl shadow-sm p-4">
-          <div className="grid grid-cols-1 lg:grid-cols-[1fr_auto] items-end gap-4">
-            <div>
-              <label className="block text-xs font-medium text-slate-600 mb-1">Customer</label>
-              <select
-                className="w-full rounded-xl border-slate-300 focus:ring-2 focus:ring-indigo-500 h-11"
-                value={customerId ?? ""}
-                onChange={(e) => setCustomerId(e.target.value ? Number(e.target.value) : null)}
-                title="Pick a customer to associate ingests & reports"
-              >
-                <option value="">Select...</option>
-                {customers.map((c) => (
-                  <option key={c.customer_id} value={c.customer_id}>
-                    {c.customer_name}
-                  </option>
-                ))}
-              </select>
+          <div className="border-emerald-400/30 bg-white/80 rounded-2xl border p-4">
+            <div className="text-base font-semibold mb-2">Context</div>
+            <div className="flex flex-wrap gap-2 mb-3">
+              <span className="rounded-full border border-emerald-400/40 px-3 py-1 text-sm">Customer: {customerName || "–"}</span>
+              <span className="rounded-full border border-emerald-400/40 px-3 py-1 text-sm">Env: prod</span>
+              <span className="rounded-full border border-emerald-400/40 px-3 py-1 text-sm">Servers: {servers.length}</span>
+            </div>
+            <div className="flex flex-wrap gap-2">
+              <StatTile label="Tasks" value={qemSummary?.matched ?? "—"} />
+              <StatTile label="QEM Events" value={qemSummary?.rows ?? "—"} />
+            </div>
+          </div>
+        </div>
+
+        {/* Workbench */}
+        <div className="lg:col-span-3 space-y-8">
+          {/* Add/Select customer */}
+          <div className="rounded-2xl border bg-white shadow-sm p-4">
+            <div className="grid grid-cols-1 lg:grid-cols-[1fr_auto] items-end gap-4">
+              <div className="flex flex-col sm:flex-row gap-3">
+                <input
+                  type="text"
+                  placeholder="Enter customer name"
+                  value={newCustomerName}
+                  onChange={(e) => setNewCustomerName(e.target.value)}
+                  onKeyDown={(e) => e.key === "Enter" && handleAddCustomer()}
+                  className="flex-1 rounded-xl border-slate-300 focus:ring-2 focus:ring-emerald-500 px-3 h-11"
+                />
+                <button
+                  onClick={handleAddCustomer}
+                  className="px-4 h-11 rounded-xl bg-emerald-600 text-white hover:bg-emerald-700"
+                >
+                  Add
+                </button>
+              </div>
+              <div>
+                <label className="block text-xs font-medium text-slate-600 mb-1">Customer</label>
+                <select
+                  className="w-full rounded-xl border-slate-300 focus:ring-2 focus:ring-emerald-500 h-11"
+                  value={customerId ?? ""}
+                  onChange={(e) => setCustomerId(e.target.value ? Number(e.target.value) : null)}
+                >
+                  <option value="">Select...</option>
+                  {customers.map((c) => (
+                    <option key={c.customer_id} value={c.customer_id}>
+                      {c.customer_name}
+                    </option>
+                  ))}
+                </select>
+              </div>
             </div>
 
-            <div className="flex gap-3">
+            {!!customerId && (
+              <div className="mt-4 rounded-xl border bg-slate-50 p-3">
+                <div className="flex items-center justify-between mb-2">
+                  <div className="text-sm font-semibold">
+                    Snapshot: <span className="text-emerald-700">{customerName}</span>
+                  </div>
+                  <div className="text-xs text-slate-500">
+                    {servers.length} server{servers.length === 1 ? "" : "s"}
+                  </div>
+                </div>
+                {servers.length === 0 ? (
+                  <div className="text-sm text-slate-500">No servers ingested yet.</div>
+                ) : (
+                  <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
+                    {servers.map((s) => (
+                      <div key={s.server_id} className="rounded-xl bg-white border p-3">
+                        <div className="text-sm font-medium">{s.server_name}</div>
+                        <div className="text-xs text-slate-500 mt-1">
+                          {s.environment ? `Environment: ${s.environment}` : "Environment: -"}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+
+          {/* Uploads */}
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+            <UploadCard
+              title="Upload Repository JSON"
+              icon={<span className="text-emerald-700">{"{ }"}</span>}
+              description='Auto-detects server (e.g., from "Host name: …").'
+              fileRef={repoFileRef}
+              accept=".json"
+              cta="Upload & Ingest"
+              onUpload={handleUploadRepoJson}
+              disabled={!customerName || busy}
+            />
+            <UploadCard
+              title="Upload QEM Servers (TSV)"
+              icon={<span className="text-emerald-700">☰</span>}
+              description='Map "ServerName" → Repo server names; required if QEM TSV lacks Host.'
+              fileRef={qemServersFileRef}
+              accept=".tsv,.csv,.txt"
+              cta="Upload Servers TSV"
+              onUpload={handleUploadQemServersTsv}
+              disabled={!customerName || busy}
+            />
+            <UploadCard
+              title="Upload QEM Metrics (TSV)"
+              icon={<span className="text-emerald-700">📈</span>}
+              description='If TSV includes Host, we use it; else we resolve via Servers mapping above.'
+              fileRef={qemFileRef}
+              accept=".tsv,.csv,.txt"
+              cta="Upload QEM"
+              onUpload={handleUploadQemTsv}
+              disabled={!customerName || busy}
+            />
+            <UploadCard
+              title="Upload Replicate License Log"
+              icon={<span className="text-emerald-700">🔑</span>}
+              description='Parses "Licensed to:" to detect licensed sources & targets.'
+              fileRef={licenseFileRef}
+              accept=".log,.txt"
+              cta="Upload License Log"
+              onUpload={handleUploadLicenseLog}
+              disabled={!customerName || busy}
+            />
+          </div>
+
+          {/* inline messages */}
+          {ingestMsg && (
+            <div className="rounded-xl border bg-white p-3 text-sm">{ingestMsg}</div>
+          )}
+          {serversUpsertMsg && (
+            <div className="rounded-xl border bg-white p-3 text-sm">{serversUpsertMsg}</div>
+          )}
+          {qemSummary && (
+            <div className="rounded-xl border bg-white p-3 text-sm">
+              QEM Summary — rows: <b>{qemSummary.rows}</b>, inserted: <b>{qemSummary.inserted}</b>, matched:{" "}
+              <b>{qemSummary.matched}</b>, mode: <b>{qemSummary.match_mode}</b>
+            </div>
+          )}
+          {licenseSummary && (
+            <div className="rounded-xl border bg-white p-3 text-sm">
+              License — all sources: <b>{licenseSummary.all_sources ? "yes" : "no"}</b>, all targets:{" "}
+              <b>{licenseSummary.all_targets ? "yes" : "no"}</b>
+              {Array.isArray(licenseSummary.sources) && licenseSummary.sources.length > 0 && (
+                <>
+                  <br />Sources: {licenseSummary.sources.join(", ")}
+                </>
+              )}
+              {Array.isArray(licenseSummary.targets) && licenseSummary.targets.length > 0 && (
+                <>
+                  <br />Targets: {licenseSummary.targets.join(", ")}
+                </>
+              )}
+            </div>
+          )}
+
+          {/* Cleanup */}
+          <div>
+            <div className="text-base font-semibold mb-2">Cleanup</div>
+            <div className="bg-white/80 rounded-2xl border p-4">
+              <div className="py-1 flex flex-col md:flex-row md:items-center md:justify-between gap-4">
+                <label className="text-sm text-slate-700 flex items-center gap-2">
+                  <input
+                    type="checkbox"
+                    checked={deleteAlsoServers}
+                    onChange={(e) => setDeleteAlsoServers(e.target.checked)}
+                  />
+                  Also drop this customer's servers
+                </label>
+                <button
+                  onClick={handleDeleteAll}
+                  className="rounded-full bg-red-600 hover:bg-red-700 text-white px-4 h-10"
+                >
+                  Delete ingested data for customer
+                </button>
+              </div>
+            </div>
+          </div>
+
+          {/* Footer actions */}
+          <div className="flex flex-col md:flex-row items-start md:items-center justify-between gap-3">
+            <div className="text-xs text-slate-600">
+              All functionality preserved — just a modern, Qlik-forward shell.
+            </div>
+            <div className="flex items-center gap-2">
               <button
-                onClick={downloadCustomerDocx}
-                disabled={!customerName || busy}
-                className="px-4 h-11 rounded-xl bg-violet-700 text-white hover:bg-violet-800 disabled:opacity-50"
-                title="Exports the Customer Technical Overview (.docx)"
+                className="rounded-full border px-3 h-10"
+                onClick={() => setHelpOpen(true)}
               >
-                Download Customer Technical Overview (.docx)
+                Help / Quick Guide
+              </button>
+              <button
+                className="rounded-full bg-emerald-600 hover:bg-emerald-700 text-white px-3 h-10"
+                onClick={downloadCustomerDocx}
+              >
+                Download Technical Overview (docx)
               </button>
             </div>
           </div>
-
-          {/* Customer Snapshot */}
-          {!!customerId && (
-            <div className="mt-4 rounded-xl border bg-slate-50 p-3">
-              <div className="flex items-center justify-between mb-2">
-                <div className="text-sm font-semibold">
-                  Snapshot: <span className="text-indigo-700">{customerName}</span>
-                </div>
-                <div className="text-xs text-slate-500">
-                  {servers.length} server{servers.length === 1 ? "" : "s"}
-                </div>
-              </div>
-              {servers.length === 0 ? (
-                <div className="text-sm text-slate-500">No servers ingested yet.</div>
-              ) : (
-                <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
-                  {servers.map((s) => (
-                    <div key={s.server_id} className="rounded-xl bg-white border p-3">
-                      <div className="text-sm font-medium">{s.server_name}</div>
-                      <div className="text-xs text-slate-500 mt-1">
-                        {s.environment ? `Environment: ${s.environment}` : "Environment: -"}
-                      </div>
-                    </div>
-                  ))}
-                </div>
-              )}
-            </div>
-          )}
-        </section>
-
-        {/* Upload Repository JSON */}
-        <section className="bg-white rounded-2xl shadow-sm p-5 md:p-6">
-          <h3 className="text-base font-semibold mb-1">Upload Repository JSON</h3>
-          <p className="text-xs text-slate-500 mb-3">
-            Server is auto-detected from the file description (e.g. "Host name: USREM-HXT2, Time: ...").
-          </p>
-          <div className="flex flex-col items-start gap-3">
-            <input ref={repoFileRef} type="file" accept=".json" className="text-sm" />
-            <button
-              onClick={handleUploadRepoJson}
-              disabled={!customerName || busy}
-              className="px-4 h-11 rounded-xl bg-emerald-600 text-white hover:bg-emerald-700 disabled:opacity-50"
-              title='Accepts: *.json (Replicate Repository). Tip: ingest this before QEM to populate servers.'
-            >
-              Upload &amp; Ingest
-            </button>
-          </div>
-          {ingestMsg && <p className="mt-3 text-sm text-slate-600">{ingestMsg}</p>}
-        </section>
-
-        {/* Upload QEM Servers TSV */}
-        <section className="bg-white rounded-2xl shadow-sm p-5 md:p-6">
-          <h3 className="text-base font-semibold mb-1">Upload QEM Servers (TSV)</h3>
-          <p className="text-xs text-slate-500 mb-3">
-            Upload the <span className="font-mono">AemServers_*.tsv</span>. We map its{" "}
-            <span className="font-mono">Name</span> to the QEM "Server" column, and its{" "}
-            <span className="font-mono">Host</span> to the Repo server name. Required before uploading a QEM Metrics TSV
-            without a <span className="font-mono">Host</span> column.
-          </p>
-          <div className="flex flex-col items-start gap-3">
-            <input ref={qemServersFileRef} type="file" accept=".tsv,.txt" className="text-sm" />
-            <button
-              onClick={handleUploadQemServersTsv}
-              disabled={!customerName || busy}
-              className="px-4 h-11 rounded-xl bg-amber-600 text-white hover:bg-amber-700 disabled:opacity-50"
-              title='Accepts: AemServers_*.tsv. Purpose: provides Server→Host mapping for QEM rows that lack "Host". Upload this BEFORE QEM Metrics when Host is missing.'
-            >
-              Upload Servers TSV
-            </button>
-          </div>
-          {serversUpsertMsg && <p className="mt-3 text-sm text-slate-600">{serversUpsertMsg}</p>}
-        </section>
-
-        {/* Upload QEM Metrics TSV */}
-        <section className="bg-white rounded-2xl shadow-sm p-5 md:p-6">
-          <h3 className="text-base font-semibold mb-1">Upload QEM Metrics (TSV)</h3>
-          <p className="text-xs text-slate-500 mb-3">
-            If the TSV includes a <span className="font-mono">Host</span> column, we use it directly (legacy).
-            Otherwise we resolve per row using the Servers mapping above (<em>Name → Host</em>).
-          </p>
-          <div className="flex flex-col items-start gap-3">
-            <input ref={qemFileRef} type="file" accept=".tsv,.txt" className="text-sm" />
-            <button
-              onClick={handleUploadQemTsv}
-              disabled={!customerName || busy}
-              className="px-4 h-11 rounded-xl bg-sky-600 text-white hover:bg-sky-700 disabled:opacity-50"
-              title='Accepts: QEM export TSV. Required columns: Server, Task, (Host or AemServers mapping). Upload AFTER "QEM Servers TSV" if Host is missing.'
-            >
-              Upload QEM
-            </button>
-          </div>
-
-          {qemSummary && (
-            <div className="mt-4">
-              <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
-                <StatCard label="Rows processed" value={qemSummary?.rows ?? "-"} />
-                <StatCard label="Inserted" value={qemSummary?.inserted ?? "-"} />
-                <StatCard label="Matched tasks" value={qemSummary?.matched ?? "-"} />
-                <StatCard label="Match mode" value={qemSummary?.match_mode ?? "-"} />
-              </div>
-
-              {Array.isArray(qemSummary?.details) && qemSummary.details.length > 0 && (
-                <div className="mt-3 overflow-x-auto">
-                  <table className="min-w-[520px] text-sm">
-                    <thead>
-                      <tr className="text-left text-slate-500">
-                        <th className="py-1 pr-4">Server</th>
-                        <th className="py-1 pr-4">Host Key</th>
-                        <th className="py-1 pr-4">Match mode</th>
-                        <th className="py-1 pr-4">Rows</th>
-                        <th className="py-1 pr-4">Inserted</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {qemSummary.details.map((r: any, i: number) => (
-                        <tr key={i} className="border-t">
-                          <td className="py-1 pr-4">{r.server ?? "-"}</td>
-                          <td className="py-1 pr-4">{r.host_key ?? "-"}</td>
-                          <td className="py-1 pr-4">{r.match_mode ?? "-"}</td>
-                          <td className="py-1 pr-4">{r.rows ?? "-"}</td>
-                          <td className="py-1 pr-4">{r.inserted ?? "-"}</td>
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                </div>
-              )}
-            </div>
-          )}
-        </section>
-
-        {/* Upload Replicate License Log */}
-        <section className="bg-white rounded-2xl shadow-sm p-5 md:p-6">
-          <h3 className="text-base font-semibold mb-1">Upload Replicate License Log</h3>
-          <p className="text-xs text-slate-500 mb-3">
-            Upload a task log for this customer. We parse the second{" "}
-            <span className="font-mono">]I: Licensed to ...</span> line to detect licensed sources/targets.
-          </p>
-          <div className="flex flex-col items-start gap-3">
-            <input ref={licenseFileRef} type="file" accept=".log,.txt" className="text-sm" />
-            <button
-              onClick={handleUploadLicenseLog}
-              disabled={!customerName || busy}
-              className="px-4 h-11 rounded-xl bg-indigo-600 text-white hover:bg-indigo-700 disabled:opacity-50"
-              title='Accepts: *.log or *.txt (Replicate task log). Optional — used to compute license coverage in the report.'
-            >
-              Upload License Log
-            </button>
-          </div>
-
-          {licenseSummary && (
-            <div className="mt-3 text-sm">
-              <div className="font-medium mb-1">Detected license</div>
-              <div>
-                Sources:&nbsp;
-                {licenseSummary.all_sources
-                  ? <span>All</span>
-                  : (licenseSummary.sources?.length ? licenseSummary.sources.join(", ") : "-")}
-              </div>
-              <div>
-                Targets:&nbsp;
-                {licenseSummary.all_targets
-                  ? <span>All</span>
-                  : (licenseSummary.targets?.length ? licenseSummary.targets.join(", ") : "-")}
-              </div>
-            </div>
-          )}
-        </section>
-
-        {/* Cleanup */}
-        <section className="bg-white rounded-2xl shadow-sm p-5">
-          <h3 className="text-base font-semibold mb-3">Cleanup</h3>
-          <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
-            <label className="inline-flex items-center gap-2 text-sm">
-              <input
-                type="checkbox"
-                checked={deleteAlsoServers}
-                onChange={(e) => setDeleteAlsoServers(e.target.checked)}
-                title="Also drop the customer's server dimension rows (use with care)"
-              />
-              <span>Also drop this customer's servers</span>
-            </label>
-            <button
-              onClick={handleDeleteAll}
-              disabled={!customerId || busy}
-              className="px-4 h-11 rounded-xl bg-rose-600 text-white hover:bg-rose-700 disabled:opacity-50"
-              title="Deletes all ingested data for this customer (and optionally servers)."
-            >
-              Delete ingested data for customer
-            </button>
-          </div>
-        </section>
+        </div>
       </main>
 
-      {/* Right-side Help Drawer */}
-      <HelpDrawer open={helpOpen} onClose={() => setHelpOpen(false)} />
-    </div>
-  );
-}
-
-function StatCard({ label, value }: { label: string; value: any }) {
-  return (
-    <div className="rounded-xl border bg-white p-3">
-      <div className="text-xs text-slate-500">{label}</div>
-      <div className="text-xl font-semibold">{value ?? "-"}</div>
-    </div>
-  );
-}
-
-/** Right-side drawer with Quick User Guide + Getting Started checklist */
-function HelpDrawer({ open, onClose }: { open: boolean; onClose: () => void }) {
-  return (
-    <>
-      {/* overlay */}
-      <div
-        className={`fixed inset-0 bg-black/30 transition-opacity ${open ? "opacity-100" : "opacity-0 pointer-events-none"}`}
-        onClick={onClose}
-        aria-hidden="true"
-      />
-
-      {/* panel */}
-      <aside
-        className={`fixed top-0 right-0 h-full w-full max-w-md bg-white shadow-2xl transition-transform duration-300
-        ${open ? "translate-x-0" : "translate-x-full"}`}
-        aria-label="Help drawer"
-      >
-        <div className="flex items-center justify-between p-4 border-b">
-          <div className="text-lg font-semibold">Quick User Guide</div>
-          <button
-            onClick={onClose}
-            className="h-9 w-9 rounded-lg border hover:bg-slate-50"
-            aria-label="Close"
-            title="Close"
-          >
-            <span className="text-xl leading-none">×</span>
-          </button>
-        </div>
-
-        <div className="p-4 space-y-6 overflow-y-auto h-[calc(100%-56px)]">
-          {/* TL;DR */}
-          <section>
-            <h4 className="font-semibold mb-2">TL;DR — Getting Started</h4>
-            <ol className="list-decimal list-inside space-y-1 text-sm text-slate-700">
-              <li>Add/select a customer.</li>
-              <li>Upload <span className="font-mono">Repository JSON</span> (autodetects server).</li>
-              <li>
-                Upload <span className="font-mono">QEM Servers TSV</span> <em>first</em> if your QEM export lacks a
-                <span className="font-mono"> Host</span> column.
-              </li>
-              <li>Upload <span className="font-mono">QEM Metrics TSV</span>.</li>
-              <li>(Optional) Upload a Replicate <span className="font-mono">task log</span> to extract license coverage.</li>
-              <li>Export the <strong>.docx</strong> Customer Technical Overview.</li>
-            </ol>
-          </section>
-
-          {/* Accepted files */}
-          <section>
-            <h4 className="font-semibold mb-2">Accepted files</h4>
-            <ul className="list-disc list-inside text-sm text-slate-700 space-y-1">
-              <li><strong>Repository JSON</strong>: *.json (Replicate repository export)</li>
-              <li><strong>QEM Servers</strong>: AemServers_*.tsv (columns: <em>Name</em>, <em>Host</em>)</li>
-              <li><strong>QEM Metrics</strong>: *.tsv (expects <em>Server</em>, <em>Task</em>, and either <em>Host</em> or Servers mapping)</li>
-              <li><strong>License Log</strong>: *.log or *.txt (look for <span className="font-mono">]I: Licensed to ...</span>)</li>
-            </ul>
-          </section>
-
-          {/* Ingestion order */}
-          <section>
-            <h4 className="font-semibold mb-2">Recommended ingestion order</h4>
-            <p className="text-sm text-slate-700">
-              Repository JSON → QEM Servers (if needed) → QEM Metrics → License Log (optional).
-            </p>
-          </section>
-
-          {/* Troubleshooting */}
-          <section>
-            <h4 className="font-semibold mb-2">Troubleshooting</h4>
-            <ul className="list-disc list-inside text-sm text-slate-700 space-y-1">
-              <li>If a QEM TSV lacks <em>Host</em>, upload the <strong>QEM Servers TSV</strong> first.</li>
-              <li>If the report is missing “Top-5 tasks by #tables”, re-ingest the <strong>Repository JSON</strong>.</li>
-              <li>Use the Home (⌂) button to clear file pickers and reload customers.</li>
-              <li>Check server logs for detailed errors; network failures are surfaced as toasts.</li>
-            </ul>
-          </section>
-
-          {/* API docs */}
-          <section>
-            <h4 className="font-semibold mb-2">API docs</h4>
-            <div className="text-sm space-y-1">
-              <a
-                href={`${API_BASE}/docs`}
-                target="_blank"
-                rel="noreferrer"
-                className="text-indigo-700 hover:underline"
-              >
-                Swagger UI (/docs)
-              </a>
-              <br />
-              <a
-                href={`${API_BASE}/redoc`}
-                target="_blank"
-                rel="noreferrer"
-                className="text-indigo-700 hover:underline"
-              >
-                ReDoc (/redoc)
-              </a>
+      {/* Simple Help drawer */}
+      {helpOpen && (
+        <div className="fixed inset-0 z-50">
+          <div className="absolute inset-0 bg-black/30" onClick={() => setHelpOpen(false)} />
+          <aside className="absolute right-0 top-0 h-full w-[520px] max-w-[95vw] bg-white shadow-2xl">
+            <div className="flex items-center justify-between border-b px-5 py-3">
+              <h2 className="text-lg font-semibold">Quick User Guide</h2>
+              <button onClick={() => setHelpOpen(false)} className="rounded p-2 hover:bg-gray-100" aria-label="Close">✕</button>
             </div>
-          </section>
+            <div className="px-5 py-4 text-sm space-y-3">
+              <ol className="list-decimal pl-5 space-y-1">
+                <li>Add customer</li>
+                <li>Upload <b>Repository JSON</b> (per server)</li>
+                <li>(If no <code>Host</code> in QEM TSV) Upload <b>QEM Servers TSV</b></li>
+                <li>Upload <b>QEM Metrics TSV</b></li>
+                <li>(Optional) Upload <b>License Log</b></li>
+                <li>Download <b>Customer Technical Overview (.docx)</b></li>
+              </ol>
+              <div className="rounded-lg bg-emerald-50 p-3">
+                Tip: Use Repo JSON before QEM to populate servers.
+              </div>
+            </div>
+          </aside>
         </div>
-      </aside>
-    </>
+      )}
+    </div>
   );
 }

@@ -2,9 +2,39 @@ import io
 import os
 import re
 import logging
+from typing import List, Tuple, Dict, Optional, Iterable
+
+
+# --- helpers: group Top-5 metrics by server ----------------------------------
+def _group_top5_by_server_tables(rows: List[Tuple[str, str, int]]) -> Dict[str, List[Tuple[str, int]]]:
+    """
+    rows: [(server_name, task_name, tables_count), ...]
+    returns: {server_name: [(task_name, tables_count), ... top 5 desc]}
+    """
+    top: Dict[str, List[Tuple[str, int]]] = defaultdict(list)
+    for server, task, tables in rows:
+        top[server].append((task, tables))
+    for s in list(top.keys()):
+        top[s].sort(key=lambda x: x[1], reverse=True)
+        top[s] = top[s][:5]
+    return top
+
+def _group_top5_by_server_apply(rows: List[Tuple[str, str, float]]) -> Dict[str, List[Tuple[str, float]]]:
+    """
+    rows: [(server_name, task_name, avg_apply_rec_per_sec), ...]
+    returns: {server_name: [(task_name, avg_apply), ... top 5 desc]}
+    """
+    top: Dict[str, List[Tuple[str, float]]] = defaultdict(list)
+    for server, task, avg_apply in rows:
+        top[server].append((task, avg_apply))
+    for s in list(top.keys()):
+        top[s].sort(key=lambda x: x[1], reverse=True)
+        top[s] = top[s][:5]
+    return top
+# -----------------------------------------------------------------------------
 from collections import defaultdict
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Tuple, Optional, NamedTuple
+from typing import Any, Dict, List, Tuple, Optional, NamedTuple, Dict, List, Tuple
 
 import httpx  # used to fetch latest GA train from GitHub
 
@@ -85,6 +115,7 @@ BUILTIN_MASTER_TARGET_ENDPOINTS = [
     "IBM DB2 for iSeries",
     "Microsoft SQL Server",
     "MySQL",
+    "PostgreSQL",                    # added – appears in your data
     "MariaDB",
     "SAP Sybase ASE",
     "File endpoint",
@@ -93,6 +124,7 @@ BUILTIN_MASTER_TARGET_ENDPOINTS = [
     "Amazon S3",
     "Amazon MSK",
     "Kafka",
+    "Log Stream",                    # added – license ticker exists
     "Google BigQuery",
     "Google Cloud Storage",
     "Google Dataproc",
@@ -107,115 +139,101 @@ MASTER_SOURCE_ENDPOINTS: List[str] = []
 MASTER_TARGET_ENDPOINTS: List[str] = []
 ALIAS_TO_CANON: Dict[str, str] = {}
 
-# Expanded default alias map (fallback if DB alias table absent/empty)
+# ============================================================
+# Alias map (fallback) — built from Replicate license tickers
+# and common variants; all keys are normalized lower/alnum.
+# ============================================================
+def _n(s: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", s.lower())
+
 DEFAULT_ALIAS_TO_CANON = {
-    # SQL Server family
-    "sqlserver": "Microsoft SQL Server",
-    "sql_server": "Microsoft SQL Server",
-    "mssql": "Microsoft SQL Server",
-    "microsoftsqlserver": "Microsoft SQL Server",
-    "ms_sql_server": "Microsoft SQL Server",
-    "sqlserver_mscdc": "Microsoft SQL Server",
-    "microsoftsqlserver_mscdc": "Microsoft SQL Server",
-    "azuresql": "Microsoft Azure SQL Database",
-    "azure_sql": "Microsoft Azure SQL Database",
-    "azure_sql_database": "Microsoft Azure SQL Database",
-    "azure_sql_managed_instance": "Microsoft Azure SQL Managed Instance",
+    # ---------- Sources (License "Source Type" tickers) ----------
+    _n("IMS"): "IBM IMS (ARC)",
+    _n("VSAM"): "IBM VSAM Batch (ARC)",
+    _n("MySQL"): "MySQL",
+    _n("RDSMySQL"): "Amazon RDS for MySQL",
+    _n("Oracle"): "Oracle (on-prem / Oracle Cloud)",
+    _n("RDSPostgreSQL"): "Amazon RDS for PostgreSQL",
+    _n("RDSSQLServer"): "Amazon RDS for SQL Server",
+    _n("AWSAuroraPostgreSQL"): "Amazon Aurora (PostgreSQL)",
+    _n("AzureSQLServerM"): "Microsoft Azure SQL Database (MS-CDC)",
+    _n("File"): "File endpoint",
+    _n("FileChannel"): "File Channel endpoint",
+    _n("GoogleAlloyDBPostgreSQL"): "Google Cloud AlloyDB for PostgreSQL",
+    _n("GoogleCloudMySQL"): "Google Cloud SQL for MySQL",
+    _n("GoogleCloudPostgreSQL"): "Google Cloud SQL for PostgreSQL",
+    _n("GoogleCloudSQLServer"): "Google Cloud SQL for SQL Server",
+    _n("DB2LUW"): "IBM DB2 for LUW",
+    _n("DB2iSeries"): "IBM DB2 for iSeries",
+    _n("DB2zOS"): "IBM DB2 for z/OS",
+    _n("Informix"): "IBM Informix",
+    _n("SQLServer"): "Microsoft SQL Server",
+    _n("AzureMySQL"): "Microsoft Azure Database for MySQL",
+    _n("AzureSQL"): "Microsoft Azure SQL Database (MS-CDC)",
+    _n("MongoDBAtlas"): "MongoDB Atlas",
+    _n("MongoDB"): "MongoDB Atlas",
+    _n("PostgreSQL"): "PostgreSQL",
+    _n("SAP HANA"): "SAP HANA 2.0",
+    _n("SybaseASE"): "SAP Sybase ASE",
+    _n("Teradata"): "Teradata Vantage",
+    _n("Salesforce"): "Salesforce (Streaming CDC / Incremental Load)",
 
-    # PostgreSQL family
-    "postgres": "PostgreSQL",
-    "postgresql": "PostgreSQL",
-    "googlecloudsqlforpostgresql": "Google Cloud SQL for PostgreSQL",
-    "alloydb": "Google Cloud AlloyDB for PostgreSQL",
-    "googlecloudalloydbforpostgresql": "Google Cloud AlloyDB for PostgreSQL",
+    # Common free-form variants seen in QEM/JSON:
+    _n("mssql"): "Microsoft SQL Server",
+    _n("sql server"): "Microsoft SQL Server",
+    _n("azuresqldatabase"): "Microsoft Azure SQL Database",
+    _n("alloydb"): "Google Cloud AlloyDB for PostgreSQL",
+    _n("gcp alloydb"): "Google Cloud AlloyDB for PostgreSQL",
+    _n("percona"): "Percona (via MySQL endpoint)",
+    _n("mariadb"): "MariaDB",
 
-    # MySQL family
-    "mysql": "MySQL",
-    "mariadb": "MariaDB",
-    "percona": "Percona (via MySQL endpoint)",
-    "googlecloudsqlformysql": "Google Cloud SQL for MySQL",
-    "aurora_mysql": "Amazon Aurora (MySQL)",
-    "amazonaurora_mysql": "Amazon Aurora (MySQL)",
+    # ---------- Targets (License "Target Type" tickers) ----------
+    _n("MySQL"): "MySQL",
+    _n("PostgreSQL"): "PostgreSQL",
+    _n("Oracle"): "Oracle (on-prem / Oracle Cloud)",
+    _n("SQLServer"): "Microsoft SQL Server",
+    _n("S3"): "Amazon S3",
+    _n("AmazonMSK"): "Amazon MSK",
+    _n("Kafka"): "Kafka",
+    _n("LogStream"): "Log Stream",
+    _n("File"): "File endpoint",
+    _n("FileChannel"): "File Channel endpoint",
+    _n("GoogleAlloyDBPostgreSQL"): "Google Cloud AlloyDB for PostgreSQL",
+    _n("BigQuery"): "Google BigQuery",
+    _n("GoogleStorage"): "Google Cloud Storage",
+    _n("Dataproc"): "Google Dataproc",
+    _n("ADLS"): "Microsoft Azure Data Lake / ADLS Gen2 / Blob",
+    _n("AzureSQLServer"): "Microsoft Azure SQL Database",
+    _n("AzureMySQL"): "Microsoft Azure Database for MySQL",
+    _n("AzurePostgreSQL"): "Microsoft Azure Database for PostgreSQL",
+    _n("Redshift"): "Amazon Redshift",
+    _n("DB2zOS"): "IBM DB2 for z/OS",
+    _n("GCPDatabricksDelta"): "Databricks (SQL Warehouse / Lakehouse)",
+    _n("AWSDatabricksDelta"): "Databricks (SQL Warehouse / Lakehouse)",
+    _n("DatabricksAWS"): "Databricks (SQL Warehouse / Lakehouse)",
+    _n("DatabricksAzure"): "Databricks (SQL Warehouse / Lakehouse)",
+    _n("DatabricksGoogleCloud"): "Databricks (SQL Warehouse / Lakehouse)",
+    _n("AzureDatabricksDelta"): "Databricks (SQL Warehouse / Lakehouse)",
+    _n("SnowflakeAWS"): "Snowflake",
+    _n("SnowflakeAzure"): "Snowflake",
+    _n("SnowflakeGoogle"): "Snowflake",
+    _n("Snowflake"): "Snowflake",
 
-    # RDS compacts
-    "rdspostgresql": "Amazon RDS for PostgreSQL",
-    "rds_postgresql": "Amazon RDS for PostgreSQL",
-    "rdssqlserver": "Amazon RDS for SQL Server",
-    "rds_sqlserver": "Amazon RDS for SQL Server",
-    "rdsmysql": "Amazon RDS for MySQL",
-    "rds_mysql": "Amazon RDS for MySQL",
-    "rdsmariadb": "Amazon RDS for MariaDB",
-    "rds_mariadb": "Amazon RDS for MariaDB",
-    "rdsoracle": "Amazon RDS for Oracle",
-    "rds_oracle": "Amazon RDS for Oracle",
-
-    # Aurora compacts
-    "awsaurorapostgresql": "Amazon Aurora (PostgreSQL)",
-    "aurora_postgresql": "Amazon Aurora (PostgreSQL)",
-    "awsauroramysql": "Amazon Aurora (MySQL)",
-    "aurora_mysql_compact": "Amazon Aurora (MySQL)",
-
-    # Oracle family
-    "oracle": "Oracle (on-prem / Oracle Cloud)",
-    "oracleadw": "Oracle Autonomous Data Warehouse",
-    "oracle_autonomous_data_warehouse": "Oracle Autonomous Data Warehouse",
-
-    # DB2 family
-    "db2": "IBM DB2 for LUW",
-    "db2luw": "IBM DB2 for LUW",
-    "db2zos": "IBM DB2 for z/OS",
-    "db2_zos": "IBM DB2 for z/OS",
-    "db2iseries": "IBM DB2 for iSeries",
-    "db2_iseries": "IBM DB2 for iSeries",
-
-    # Other DBs
-    "informix": "IBM Informix",
-    "sybase": "SAP Sybase ASE",
-    "hana": "SAP HANA 2.0",
-    "teradata": "Teradata Vantage",
-    "mongo": "MongoDB Atlas",
-    "mongodb": "MongoDB Atlas",
-    "mongodbatlas": "MongoDB Atlas",
-
-    # Files & channels
-    "file": "File endpoint",
-    "fileendpoint": "File endpoint",
-    "file_channel": "File Channel endpoint",
-    "filechannel": "File Channel endpoint",
-
-    # Mainframe ARC
-    "ims": "IBM IMS (ARC)",
-    "vsam": "IBM VSAM Batch (ARC)",
-
-    # Salesforce
-    "salesforce": "Salesforce (Streaming CDC / Incremental Load)",
-
-    # Targets / DW / Cloud stores
-    "redshift": "Amazon Redshift",
-    "amazonredshift": "Amazon Redshift",
-    "s3": "Amazon S3",
-    "amazon_s3": "Amazon S3",
-    "msk": "Amazon MSK",
-    "amazonmsk": "Amazon MSK",
-    "kafka": "Kafka",
-    "confluentkafka": "Kafka",
-    "bigquery": "Google BigQuery",
-    "googlebigquery": "Google BigQuery",
-    "gcs": "Google Cloud Storage",
-    "googlestorage": "Google Cloud Storage",
-    "googlecloudstorage": "Google Cloud Storage",
-    "dataproc": "Google Dataproc",
-    "google_dataproc": "Google Dataproc",
-    "adls": "Microsoft Azure Data Lake / ADLS Gen2 / Blob",
-    "azure_data_lake": "Microsoft Azure Data Lake / ADLS Gen2 / Blob",
-    "blob": "Microsoft Azure Data Lake / ADLS Gen2 / Blob",
-    "databricks": "Databricks (SQL Warehouse / Lakehouse)",
-    "databricks_delta": "Databricks (SQL Warehouse / Lakehouse)",
-    "databrickslakehouse(delta)": "Databricks (SQL Warehouse / Lakehouse)",
-    "databricksaws": "Databricks (SQL Warehouse / Lakehouse)",
-    "databricksdelta": "Databricks (SQL Warehouse / Lakehouse)",
-    "snowflake": "Snowflake",
+    # more forgiving common strings
+    _n("googlegcs"): "Google Cloud Storage",
+    _n("gcs"): "Google Cloud Storage",
+    _n("ms adls"): "Microsoft Azure Data Lake / ADLS Gen2 / Blob",
+    _n("databricks"): "Databricks (SQL Warehouse / Lakehouse)",
 }
+
+# Extra permissive synonyms used across both roles
+DEFAULT_ALIAS_TO_CANON.update({
+    _n("microsoftsqlserver"): "Microsoft SQL Server",
+    _n("sqlserver_mscdc"): "Microsoft SQL Server",
+    _n("postgres"): "PostgreSQL",
+    _n("postgresql"): "PostgreSQL",
+    _n("googlebigquery"): "Google BigQuery",
+})
 
 # ============================================================
 # Utilities: normalization & noise filtering
@@ -223,7 +241,7 @@ DEFAULT_ALIAS_TO_CANON = {
 def _normalize_token(s: str) -> str:
     return re.sub(r"[^a-z0-9]+", "", (s or "").lower())
 
-_STRIP_TAILS = [" (ms-cdc)"]  # noise suffixes that sometimes leak
+_STRIP_TAILS = [" (ms-cdc)"]
 
 def _filter_noise_token(s: str) -> bool:
     return _normalize_token(s) in {"na", "n/a", "null", "nulltarget", "unknown", "(unknown)"}
@@ -241,7 +259,7 @@ def canonize_to_master(name: str, is_source: bool) -> str:
         return "Unknown"
     n = str(name).strip()
 
-    # strip known tails if not already master
+    # strip tails
     low = n.lower()
     for t in _STRIP_TAILS:
         if low.endswith(t) and _normalize_token(n) not in MASTER_NORM:
@@ -258,7 +276,7 @@ def canonize_to_master(name: str, is_source: bool) -> str:
     if key in ALIAS_TO_CANON:
         return ALIAS_TO_CANON[key]
 
-    # last-ditch: case-insensitive compare
+    # last-ditch: case-insensitive compare within relevant universe
     master = MASTER_SOURCE_ENDPOINTS if is_source else MASTER_TARGET_ENDPOINTS
     for m in master:
         if m.lower() == n.lower():
@@ -290,37 +308,28 @@ async def _all(conn, sql: str, params: Tuple[Any, ...]) -> List[Dict[str, Any]]:
     return list(rows or [])
 
 async def _try_all(conn, sql: str, params: Tuple[Any, ...]) -> Optional[List[Dict[str, Any]]]:
-    """
-    Return rows or None if relation doesn't exist / query fails.
-    IMPORTANT: rollback on error so the connection leaves the 'aborted' state.
-    """
     try:
         return await _all(conn, sql, params)
     except Exception as e:
-        log.debug("optional query failed (expected if view/table absent): %s", e)
+        log.debug("optional query failed; rolling back: %s", e)
         try:
             await conn.rollback()
-        except Exception as rb_e:
-            log.debug("rollback after optional query failure also failed: %s", rb_e)
+        except Exception:
+            pass
         return None
 
 async def _load_master_and_alias_from_db(conn):
     """Populate MASTER_* and ALIAS_TO_CANON from DB if the config tables exist; else fall back."""
     global MASTER_SOURCE_ENDPOINTS, MASTER_TARGET_ENDPOINTS, ALIAS_TO_CANON, MASTER_NORM
 
-    # 1) Masters
     sources = await _try_all(conn, f"SELECT name FROM {SCHEMA}.endpoint_master_sources ORDER BY name", ())
     targets = await _try_all(conn, f"SELECT name FROM {SCHEMA}.endpoint_master_targets ORDER BY name", ())
     MASTER_SOURCE_ENDPOINTS = [r["name"] for r in sources] if sources else BUILTIN_MASTER_SOURCE_ENDPOINTS
     MASTER_TARGET_ENDPOINTS = [r["name"] for r in targets] if targets else BUILTIN_MASTER_TARGET_ENDPOINTS
 
-    # 2) Alias map
     alias_rows = await _try_all(
         conn,
-        f"""
-        SELECT alias, canonical, COALESCE(role,'') AS role
-        FROM {SCHEMA}.endpoint_alias_map
-        """,
+        f"SELECT alias, canonical FROM {SCHEMA}.endpoint_alias_map",
         (),
     )
     if alias_rows:
@@ -328,7 +337,6 @@ async def _load_master_and_alias_from_db(conn):
     else:
         ALIAS_TO_CANON = dict(DEFAULT_ALIAS_TO_CANON)
 
-    # 3) Build norm lookup
     MASTER_NORM = _build_master_norm()
 
 # ============================================================
@@ -419,8 +427,8 @@ def _pretty_type(raw: Any) -> str:
         "Oracle": "Oracle (on-prem / Oracle Cloud)",
         "Snowflake": "Snowflake",
         "Bigquery": "Google BigQuery",
-        "Kafka": "🧵",
-        "Filechannel": "File Channel endpoint",
+        "Kafka": "",
+        "Filechannel": "File Channel",
         "Mysql": "MySQL",
         "Db2": "IBM DB2 for LUW",
         "Redshift": "Amazon Redshift",
@@ -443,7 +451,7 @@ def _type_icon(pretty: str) -> str:
         "Oracle (on-prem / Oracle Cloud)": "🟥",
         "Snowflake": "❄️",
         "Google BigQuery": "🔷",
-        "Kafka": "🧵",
+        "Kafka": "Kafka",
         "File Channel endpoint": "📁",
         "MySQL": "🐬",
         "IBM DB2 for LUW": "🟣",
@@ -578,8 +586,8 @@ async def _ensure_latest_cache(conn) -> Optional[Train]:
                     log.debug("cache insert failed; rolling back and continuing: %s", e)
                     try:
                         await conn.rollback()
-                    except Exception as rb_e:
-                        log.debug("rollback after cache insert failure also failed: %s", rb_e)
+                    except Exception:
+                        pass
                 latest_cached = newest
     except Exception as e:
         log.warning("GitHub latest GA fetch failed; using cache if present. err=%s", e)
@@ -587,7 +595,7 @@ async def _ensure_latest_cache(conn) -> Optional[Train]:
     return await _get_latest_ga_train(conn)
 
 # ============================================================
-# License usage (modern layout, no nested tables)
+# License usage (modern layout, no "unlicensed in use" row)
 # ============================================================
 def _names_from_rows(rows: List[Dict[str, Any]], is_source: bool) -> set:
     out = set()
@@ -608,7 +616,7 @@ def _wrap_join(items: List[str]) -> str:
     return ", ".join(items) if items else "-"
 
 def _license_pill_table(doc: Document, title: str,
-                        used: List[str], licensed_not_used: List[str], unlicensed_in_use: List[str]):
+                        used: List[str], licensed_not_used: List[str]):
     _add_text(doc, title, size=11, bold=True)
     t = _add_table(
         doc,
@@ -616,13 +624,11 @@ def _license_pill_table(doc: Document, title: str,
         rows=[
             ("Used", _wrap_join(used)),
             ("Licensed not used", _wrap_join(licensed_not_used)),
-            ("⚠ Unlicensed in use", _wrap_join(unlicensed_in_use)),
         ],
         style="Light Shading Accent 1",
     )
-    # shade first column rows differently for subtle UI
-    colors = ["EEF2FF", "F1F8E9", "FFF3E0"]
-    for i in range(3):
+    colors = ["EEF2FF", "F1F8E9"]
+    for i in range(2):
         _set_cell_shading(t.rows[i+1].cells[0], colors[i])
         _cell_bold(t.rows[i+1].cells[0], 10)
 
@@ -634,16 +640,14 @@ def _license_usage_section(doc: Document,
     lic_src_universe = set(MASTER_SOURCE_ENDPOINTS) if lic_all_src else set(lic_src)
     lic_tgt_universe = set(MASTER_TARGET_ENDPOINTS) if lic_all_tgt else set(lic_tgt)
 
-    # Coverage math
+    # Coverage math (ignore "unlicensed in use" – Replicate won’t allow it)
     src_used_ct = len(used_src if lic_all_src else (used_src & lic_src_universe))
     src_total = None if lic_all_src else len(lic_src_universe)
     src_not_used = [] if lic_all_src else sorted(lic_src_universe - used_src)
-    src_unlicensed = [] if lic_all_src else sorted(used_src - lic_src_universe)
 
     tgt_used_ct = len(used_tgt if lic_all_tgt else (used_tgt & lic_tgt_universe))
     tgt_total = None if lic_all_tgt else len(lic_tgt_universe)
     tgt_not_used = [] if lic_all_tgt else sorted(lic_tgt_universe - used_tgt)
-    tgt_unlicensed = [] if lic_all_tgt else sorted(used_tgt - lic_tgt_universe)
 
     # KPI tiles
     _add_text(doc, "License Usage", size=12, bold=True)
@@ -655,10 +659,10 @@ def _license_usage_section(doc: Document,
     ])
     doc.add_paragraph()
 
-    # Panels (sequential - avoids nested tables)
-    _license_pill_table(doc, "Sources", sorted(used_src), src_not_used, src_unlicensed)
+    # Panels
+    _license_pill_table(doc, "Sources", sorted(used_src if lic_all_src else (used_src & lic_src_universe)), src_not_used)
     doc.add_paragraph()
-    _license_pill_table(doc, "Targets", sorted(used_tgt), tgt_not_used, tgt_unlicensed)
+    _license_pill_table(doc, "Targets", sorted(used_tgt if lic_all_tgt else (used_tgt & lic_tgt_universe)), tgt_not_used)
 
 # ============================================================
 # Server-level report (retained)
@@ -666,7 +670,7 @@ def _license_usage_section(doc: Document,
 async def generate_summary_docx(customer_name: str, server_name: str) -> Tuple[bytes, str]:
     async with connection() as conn:
         await _set_row_factory(conn)
-        await _load_master_and_alias_from_db(conn)  # ensure masters/aliases ready
+        await _load_master_and_alias_from_db(conn)
 
         run_row = await _one(
             conn,
@@ -755,12 +759,14 @@ def _endpoint_mix_cards(doc: Document,
     for i in range(max_len):
         if i < len(src_items):
             s_label, s_n = src_items[i]
-            table.rows[i + 1].cells[0].text = f"{_type_icon(s_label)}  {s_label} - {_fmt_int(s_n)}"
+            icon = _type_icon(s_label)
+            table.rows[i + 1].cells[0].text = f"{(icon + '  ') if icon else ''}{s_label} - {_fmt_int(s_n)}"
         else:
             table.rows[i + 1].cells[0].text = ""
         if i < len(tgt_items):
             t_label, t_n = tgt_items[i]
-            table.rows[i + 1].cells[1].text = f"{_type_icon(t_label)}  {t_label} - {_fmt_int(t_n)}"
+            icon = _type_icon(t_label)
+            table.rows[i + 1].cells[1].text = f"{(icon + '  ') if icon else ''}{t_label} - {_fmt_int(t_n)}"
         else:
             table.rows[i + 1].cells[1].text = ""
 
@@ -794,13 +800,12 @@ async def generate_customer_report_docx(customer_name: str) -> Tuple[bytes, str]
             raise ValueError(f"No servers found for customer '{customer_name}'. Ingest repository JSONs first.")
 
         # ---------- Latest Replicate version per server ----------
-        # Try a view first
         version_rows = await _try_all(
             conn,
             f"SELECT server_name, replicate_version, last_repo FROM {SCHEMA}.v_customer_latest_runs WHERE customer_id=%s",
             (customer_id,),
         )
-        if version_rows is None:  # fallback
+        if version_rows is None:
             version_rows = await _all(
                 conn,
                 f"""
@@ -1060,62 +1065,98 @@ async def generate_customer_report_docx(customer_name: str) -> Tuple[bytes, str]
         for r in coverage:
             cov_map[(_pretty_type(r["s_type"]), _pretty_type(r["t_type"]))] = int(r["n"])
 
-        # ---------- License coverage ----------
-        used_source_types = _names_from_rows(src_rows_used, is_source=True)
-        used_target_types = _names_from_rows(tgt_rows_used, is_source=False)
-
-        # Latest customer license row (view)
-        lic_row = await _one(
-            conn,
-            f"SELECT * FROM {SCHEMA}.v_latest_customer_license WHERE customer_id=%s",
-            (customer_id,),
-        )
-        lic_all_src = bool(lic_row.get("licensed_all_sources")) if lic_row else False
-        lic_all_tgt = bool(lic_row.get("licensed_all_targets")) if lic_row else False
-        lic_src = set()
-        lic_tgt = set()
-        if lic_row:
-            for s in (lic_row.get("licensed_sources") or []):
-                lic_src.add(canonize_to_master(s, is_source=True))
-            for t in (lic_row.get("licensed_targets") or []):
-                lic_tgt.add(canonize_to_master(t, is_source=False))
-
-        # ---------- NEW: Top-5 tasks by #tables per server (precompute once) ----------
-        top_tables_by_server: Dict[str, List[Tuple[str, int]]] = defaultdict(list)
-        top_tables_rows = await _try_all(
+        # ---------- License coverage (use repmeta.v_license_vs_usage) ----------
+        # Prefer the DB view that already expands explicit tickers + wildcard "ALL" into families.
+        # It exposes: customer_id, ef_role ('SOURCE'/'TARGET'), family_name, is_licensed (bool),
+        # and configured_count (endpoints configured in rep_database mapped to that family).
+        lic_rows = await _all(
             conn,
             f"""
-            WITH latest AS (
-              SELECT server_id, MAX(created_at) AS last_ingest
-              FROM {SCHEMA}.ingest_run
-              WHERE customer_id=%s
-              GROUP BY server_id
-            ),
-            counts AS (
-              SELECT r.server_id, t.task_name, COUNT(*) AS n_tables
-              FROM {SCHEMA}.rep_task_table tt
-              JOIN {SCHEMA}.rep_task t ON t.task_id = tt.task_id AND t.run_id = tt.run_id
-              JOIN {SCHEMA}.ingest_run r ON r.run_id = tt.run_id
-              JOIN latest l
-                ON l.server_id = r.server_id AND r.created_at = l.last_ingest
-              GROUP BY r.server_id, t.task_name
-            ),
-            ranked AS (
-              SELECT server_id, task_name, n_tables,
-                     ROW_NUMBER() OVER (PARTITION BY server_id ORDER BY n_tables DESC, task_name) AS rn
-              FROM counts
-            )
-            SELECT s.server_name, task_name, n_tables
-            FROM ranked rk
-            JOIN {SCHEMA}.dim_server s ON s.server_id = rk.server_id
-            WHERE rk.rn <= 5 AND s.customer_id = %s
-            ORDER BY s.server_name, n_tables DESC, task_name
-            """,
-            (customer_id, customer_id),
+            SELECT ef_role, family_name, is_licensed, COALESCE(configured_count,0) AS configured_count
+            FROM {SCHEMA}.v_license_vs_usage
+            WHERE customer_id=%s
+            """ ,
+            (customer_id,),
         )
-        if top_tables_rows:
-            for r in top_tables_rows:
-                top_tables_by_server[r["server_name"]].append((r["task_name"], int(r["n_tables"])))
+
+        used_source_types, used_target_types = set(), set()
+        lic_src, lic_tgt = set(), set()
+
+        for r in (lic_rows or []):
+            fam = str(r.get("family_name") or "").strip()
+            role = str(r.get("ef_role") or "").strip().upper()
+            if not fam or not role:
+                continue
+            if bool(r.get("is_licensed")):
+                if role == "SOURCE":
+                    lic_src.add(fam)
+                elif role == "TARGET":
+                    lic_tgt.add(fam)
+            if int(r.get("configured_count") or 0) > 0:
+                if role == "SOURCE":
+                    used_source_types.add(fam)
+                elif role == "TARGET":
+                    used_target_types.add(fam)
+
+        # Determine whether the license effectively covers ALL families.
+        lic_all_src = lic_src == set(MASTER_SOURCE_ENDPOINTS)
+        lic_all_tgt = lic_tgt == set(MASTER_TARGET_ENDPOINTS)
+
+        # Fallback: if the view is missing/empty, fall back to previous behavior
+        if (not lic_rows):
+            lic_row = await _one(
+                conn,
+                f"SELECT * FROM {SCHEMA}.v_latest_customer_license WHERE customer_id=%s",
+                (customer_id,),
+            )
+            lic_all_src = bool(lic_row.get("licensed_all_sources")) if lic_row else False
+            lic_all_tgt = bool(lic_row.get("licensed_all_targets")) if lic_row else False
+            lic_src, lic_tgt = set(), set()
+            if lic_row:
+                for s in (lic_row.get("licensed_sources") or []):
+                    lic_src.add(canonize_to_master(s, is_source=True))
+                for t in (lic_row.get("licensed_targets") or []):
+                    lic_tgt.add(canonize_to_master(t, is_source=False))
+
+            # Prior approach for "used" based on endpoint mix tables (already queried above)
+            used_source_types = _names_from_rows(src_rows_used, is_source=True)
+            used_target_types = _names_from_rows(tgt_rows_used, is_source=False)
+            top_tables_by_server: Dict[str, List[Tuple[str, int]]] = defaultdict(list)
+            # ---------- NEW: Top-5 tasks by #tables per server (precompute once) ----------
+            top_tables_rows = await _try_all(
+                conn,
+                f"""
+                WITH latest AS (
+                  SELECT server_id, MAX(created_at) AS last_ingest
+                  FROM {SCHEMA}.ingest_run
+                  WHERE customer_id=%s
+                  GROUP BY server_id
+                ),
+                counts AS (
+                  SELECT r.server_id, t.task_name, COUNT(*) AS n_tables
+                  FROM {SCHEMA}.rep_task_table tt
+                  JOIN {SCHEMA}.rep_task t ON t.task_id = tt.task_id AND t.run_id = tt.run_id
+                  JOIN {SCHEMA}.ingest_run r ON r.run_id = tt.run_id
+                  JOIN latest l
+                    ON l.server_id = r.server_id AND r.created_at = l.last_ingest
+                  GROUP BY r.server_id, t.task_name
+                ),
+                ranked AS (
+                  SELECT server_id, task_name, n_tables,
+                         ROW_NUMBER() OVER (PARTITION BY server_id ORDER BY n_tables DESC, task_name) AS rn
+                  FROM counts
+                )
+                SELECT s.server_name, task_name, n_tables
+                FROM ranked rk
+                JOIN {SCHEMA}.dim_server s ON s.server_id = rk.server_id
+                WHERE rk.rn <= 5 AND s.customer_id = %s
+                ORDER BY s.server_name, n_tables DESC, task_name
+                """,
+                (customer_id, customer_id),
+            )
+            if top_tables_rows:
+                for r in top_tables_rows:
+                    top_tables_by_server[r["server_name"]].append((r["task_name"], int(r["n_tables"])))
 
     # ---------------- DOCX BUILD ----------------
     doc = Document()
@@ -1155,7 +1196,7 @@ async def generate_customer_report_docx(customer_name: str) -> Tuple[bytes, str]
     _endpoint_mix_cards(doc, src_rows_used, tgt_rows_used, bool(src_rows_used and tgt_rows_used))
     doc.add_paragraph()
 
-    # License Usage - modern design (no nested tables)
+    # License Usage - modern design (no "unlicensed in use")
     _license_usage_section(
         doc,
         used_source_types, used_target_types,
@@ -1388,7 +1429,7 @@ async def generate_customer_report_docx(customer_name: str) -> Tuple[bytes, str]
     headers = ["Source \\ Target"] + [f"{_type_icon(t)}  {t}" for t in tgt_types]
     rows = []
     for s_type in src_types:
-        row = [f"{_type_icon(s_type)}  {s_type}"]
+        row = [(f"{_type_icon(s_type)}  {s_type}" if _type_icon(s_type) else s_type)]
         for t_type in tgt_types:
             row.append(_fmt_int(cov_map.get((s_type, t_type), 0)))
         rows.append(tuple(row))
