@@ -1,40 +1,11 @@
+
 import io
 import os
 import re
 import logging
-from typing import List, Tuple, Dict, Optional, Iterable
-
-
-# --- helpers: group Top-5 metrics by server ----------------------------------
-def _group_top5_by_server_tables(rows: List[Tuple[str, str, int]]) -> Dict[str, List[Tuple[str, int]]]:
-    """
-    rows: [(server_name, task_name, tables_count), ...]
-    returns: {server_name: [(task_name, tables_count), ... top 5 desc]}
-    """
-    top: Dict[str, List[Tuple[str, int]]] = defaultdict(list)
-    for server, task, tables in rows:
-        top[server].append((task, tables))
-    for s in list(top.keys()):
-        top[s].sort(key=lambda x: x[1], reverse=True)
-        top[s] = top[s][:5]
-    return top
-
-def _group_top5_by_server_apply(rows: List[Tuple[str, str, float]]) -> Dict[str, List[Tuple[str, float]]]:
-    """
-    rows: [(server_name, task_name, avg_apply_rec_per_sec), ...]
-    returns: {server_name: [(task_name, avg_apply), ... top 5 desc]}
-    """
-    top: Dict[str, List[Tuple[str, float]]] = defaultdict(list)
-    for server, task, avg_apply in rows:
-        top[server].append((task, avg_apply))
-    for s in list(top.keys()):
-        top[s].sort(key=lambda x: x[1], reverse=True)
-        top[s] = top[s][:5]
-    return top
-# -----------------------------------------------------------------------------
 from collections import defaultdict
-from datetime import datetime, timezone
-from typing import Any, Dict, List, Tuple, Optional, NamedTuple, Dict, List, Tuple
+from datetime import datetime, timezone, date
+from typing import Any, Dict, List, Tuple, Optional, NamedTuple
 
 import httpx  # used to fetch latest GA train from GitHub
 
@@ -115,7 +86,7 @@ BUILTIN_MASTER_TARGET_ENDPOINTS = [
     "IBM DB2 for iSeries",
     "Microsoft SQL Server",
     "MySQL",
-    "PostgreSQL",                    # added – appears in your data
+    "PostgreSQL",
     "MariaDB",
     "SAP Sybase ASE",
     "File endpoint",
@@ -124,7 +95,7 @@ BUILTIN_MASTER_TARGET_ENDPOINTS = [
     "Amazon S3",
     "Amazon MSK",
     "Kafka",
-    "Log Stream",                    # added – license ticker exists
+    "Log Stream",
     "Google BigQuery",
     "Google Cloud Storage",
     "Google Dataproc",
@@ -138,16 +109,16 @@ BUILTIN_MASTER_TARGET_ENDPOINTS = [
 MASTER_SOURCE_ENDPOINTS: List[str] = []
 MASTER_TARGET_ENDPOINTS: List[str] = []
 ALIAS_TO_CANON: Dict[str, str] = {}
+MASTER_NORM: Dict[str, str] = {}  # set at runtime after loading masters
 
 # ============================================================
-# Alias map (fallback) — built from Replicate license tickers
-# and common variants; all keys are normalized lower/alnum.
+# Alias map (fallback) — built from Replicate license tickers and common variants
 # ============================================================
 def _n(s: str) -> str:
     return re.sub(r"[^a-z0-9]+", "", s.lower())
 
-DEFAULT_ALIAS_TO_CANON = {
-    # ---------- Sources (License "Source Type" tickers) ----------
+DEFAULT_ALIAS_TO_CANON: Dict[str, str] = {
+    # ---------- Sources ----------
     _n("IMS"): "IBM IMS (ARC)",
     _n("VSAM"): "IBM VSAM Batch (ARC)",
     _n("MySQL"): "MySQL",
@@ -187,7 +158,7 @@ DEFAULT_ALIAS_TO_CANON = {
     _n("percona"): "Percona (via MySQL endpoint)",
     _n("mariadb"): "MariaDB",
 
-    # ---------- Targets (License "Target Type" tickers) ----------
+    # ---------- Targets ----------
     _n("MySQL"): "MySQL",
     _n("PostgreSQL"): "PostgreSQL",
     _n("Oracle"): "Oracle (on-prem / Oracle Cloud)",
@@ -247,12 +218,7 @@ def _filter_noise_token(s: str) -> bool:
     return _normalize_token(s) in {"na", "n/a", "null", "nulltarget", "unknown", "(unknown)"}
 
 def _build_master_norm() -> Dict[str, str]:
-    return {
-        _normalize_token(name): name
-        for name in (MASTER_SOURCE_ENDPOINTS + MASTER_TARGET_ENDPOINTS)
-    }
-
-MASTER_NORM: Dict[str, str] = {}  # set at runtime after loading masters
+    return { _normalize_token(name): name for name in (MASTER_SOURCE_ENDPOINTS + MASTER_TARGET_ENDPOINTS) }
 
 def canonize_to_master(name: str, is_source: bool) -> str:
     if not name:
@@ -289,8 +255,8 @@ def canonize_to_master(name: str, is_source: bool) -> str:
 # ============================================================
 async def _set_row_factory(conn):
     try:
-        from psycopg.rows import dict_row
-        await conn.set_row_factory(dict_row)
+        from psycopg.rows import dict_row  # type: ignore
+        await conn.set_row_factory(dict_row)  # psycopg3 async
     except Exception:
         try:
             conn.row_factory = dict_row  # type: ignore[attr-defined]
@@ -327,11 +293,7 @@ async def _load_master_and_alias_from_db(conn):
     MASTER_SOURCE_ENDPOINTS = [r["name"] for r in sources] if sources else BUILTIN_MASTER_SOURCE_ENDPOINTS
     MASTER_TARGET_ENDPOINTS = [r["name"] for r in targets] if targets else BUILTIN_MASTER_TARGET_ENDPOINTS
 
-    alias_rows = await _try_all(
-        conn,
-        f"SELECT alias, canonical FROM {SCHEMA}.endpoint_alias_map",
-        (),
-    )
+    alias_rows = await _try_all(conn, f"SELECT alias, canonical FROM {SCHEMA}.endpoint_alias_map", ())
     if alias_rows:
         ALIAS_TO_CANON = { _normalize_token(r["alias"]): r["canonical"] for r in alias_rows }
     else:
@@ -417,6 +379,160 @@ def _fmt_int(x: Any) -> str:
     except Exception:
         return str(x)
 
+# ==== Metrics helpers (added) ==================================================
+def _fmt_bytes(n: float) -> str:
+    try:
+        x = float(n or 0)
+    except Exception:
+        return str(n)
+    units = ["B","KB","MB","GB","TB","PB"]
+    k = 1000.0
+    i = 0
+    while x >= k and i < len(units)-1:
+        x /= k
+        i += 1
+    if i == 0:
+        return f"{int(x)} {units[i]}"
+    return f"{x:.1f} {units[i]}"
+
+async def _metrics_monthly_current_year(conn, customer_id: int):
+    sql = f"""
+        SELECT date_trunc('month', COALESCE(e.stop_ts, e.start_ts))::date AS m,
+               COALESCE(SUM(e.load_bytes),0) AS load_b,
+               COALESCE(SUM(e.cdc_bytes),0)  AS cdc_b
+        FROM {SCHEMA}.rep_metrics_event e
+        JOIN {SCHEMA}.rep_metrics_run r ON r.metrics_run_id = e.metrics_run_id
+        WHERE r.customer_id = %s
+          AND e.event_type = 'STOP'
+          AND COALESCE(e.status, 'Ok') = 'Ok'
+          AND date_part('year', COALESCE(e.stop_ts, e.start_ts)) = date_part('year', CURRENT_DATE)
+        GROUP BY 1 ORDER BY 1;
+    """
+    rows = await _try_all(conn, sql, (customer_id,)) or []
+    from datetime import datetime as _dt
+    out = []
+    for r in rows:
+        label = _dt.fromisoformat(str(r["m"])).strftime("%Y-%m")
+        lb = int(r.get("load_b") or 0); cb = int(r.get("cdc_b") or 0)
+        out.append((label, _fmt_bytes(lb), _fmt_bytes(cb), _fmt_bytes(lb+cb)))
+    return out
+
+async def _metrics_yearly_last5(conn, customer_id: int):
+    sql = f"""
+        SELECT date_part('year', COALESCE(e.stop_ts, e.start_ts))::int AS y,
+               COALESCE(SUM(e.load_bytes),0) AS load_b,
+               COALESCE(SUM(e.cdc_bytes),0)  AS cdc_b
+        FROM {SCHEMA}.rep_metrics_event e
+        JOIN {SCHEMA}.rep_metrics_run r ON r.metrics_run_id = e.metrics_run_id
+        WHERE r.customer_id = %s
+          AND e.event_type = 'STOP'
+          AND COALESCE(e.status, 'Ok') = 'Ok'
+          AND date_part('year', COALESCE(e.stop_ts, e.start_ts)) >= date_part('year', CURRENT_DATE) - 4
+        GROUP BY 1 ORDER BY 1;
+    """
+    rows = await _try_all(conn, sql, (customer_id,)) or []
+    out = []
+    for r in rows:
+        y = int(r["y"]); lb = int(r.get("load_b") or 0); cb = int(r.get("cdc_b") or 0)
+        out.append((str(y), _fmt_bytes(lb), _fmt_bytes(cb), _fmt_bytes(lb+cb)))
+    return out
+
+async def _metrics_top_tasks(conn, customer_id: int, limit: int = 5):
+    sql = f"""
+        WITH agg AS (
+          SELECT r.server_id, e.task_id, e.task_uuid,
+                 COALESCE(SUM(e.load_bytes),0) AS load_b,
+                 COALESCE(SUM(e.cdc_bytes),0)  AS cdc_b
+          FROM {SCHEMA}.rep_metrics_event e
+          JOIN {SCHEMA}.rep_metrics_run r ON r.metrics_run_id = e.metrics_run_id
+          WHERE r.customer_id = %s
+            AND e.event_type = 'STOP'
+            AND COALESCE(e.status, 'Ok') = 'Ok'
+          GROUP BY 1,2,3
+        ),
+        name_resolved AS (
+          SELECT a.server_id, a.task_id, a.task_uuid, a.load_b, a.cdc_b,
+                 COALESCE(t.task_name, NULL) AS task_name
+          FROM agg a
+          LEFT JOIN LATERAL (
+            SELECT rt.task_name
+            FROM {SCHEMA}.rep_task rt
+            JOIN {SCHEMA}.ingest_run ir2 ON ir2.run_id = rt.run_id
+            WHERE ir2.customer_id = %s
+              AND ((a.task_id IS NOT NULL AND rt.task_id=a.task_id)
+                   OR (a.task_uuid IS NOT NULL AND rt.task_uuid=a.task_uuid))
+            ORDER BY rt.run_id DESC
+            LIMIT 1
+          ) t ON TRUE
+        )
+        SELECT ds.server_name, COALESCE(n.task_name, NULL) AS task_name,
+               n.task_uuid, n.load_b, n.cdc_b, (n.load_b+n.cdc_b) AS total_b
+        FROM name_resolved n
+        JOIN {SCHEMA}.dim_server ds ON ds.server_id=n.server_id
+        ORDER BY total_b DESC NULLS LAST
+        LIMIT {limit};
+    """
+    rows = await _try_all(conn, sql, (customer_id, customer_id)) or []
+    out = []
+    for r in rows:
+        name = r.get("task_name") or f"(unknown) {(r.get('task_uuid') or '')[:8]}"
+        srv  = r.get("server_name") or ""
+        lb   = int(r.get("load_b") or 0); cb = int(r.get("cdc_b") or 0)
+        out.append((name, srv, _fmt_bytes(lb), _fmt_bytes(cb), _fmt_bytes(lb+cb)))
+    return out
+
+async def _metrics_top_endpoints(conn, customer_id: int, role: str, metric: str, limit: int = 5):
+    """
+    Top endpoints across ALL STOP/Ok events (cumulative volume).
+    role   : "SOURCE" | "TARGET"
+    metric : "load" | "cdc"
+    """
+    assert role in ("SOURCE", "TARGET")
+    assert metric in ("load", "cdc")
+
+    # Choose the byte column and the family/type columns based on role
+    byte_col   = "load_bytes" if metric == "load" else "cdc_bytes"
+    fam_id_col = "source_family_id" if role == "SOURCE" else "target_family_id"
+    type_col   = "source_type"      if role == "SOURCE" else "target_type"
+
+    sql = f"""
+        SELECT
+            COALESCE(f.family_name, e.{type_col})            AS endpoint_label,
+            COALESCE(SUM(e.{byte_col}), 0)::bigint    AS vol_bytes
+        FROM {SCHEMA}.rep_metrics_event e
+        JOIN {SCHEMA}.rep_metrics_run   r ON r.metrics_run_id = e.metrics_run_id
+        LEFT JOIN {SCHEMA}.endpoint_family f ON f.family_id = e.{fam_id_col}
+        WHERE r.customer_id = %s
+          AND UPPER(COALESCE(e.event_type, '')) = 'STOP'
+          AND COALESCE(UPPER(e.status), 'OK')  = 'OK'
+        GROUP BY 1
+        ORDER BY vol_bytes DESC NULLS LAST
+        LIMIT {limit};
+    """
+
+    rows = await _try_all(conn, sql, (customer_id,)) or []
+    out = []
+    for r in rows:
+        lbl = r.get("endpoint_label")
+        if not lbl:
+            # If STOP rows ever missed type (rare per your note), skip blank labels
+            continue
+        # Normalize label to your master alias (e.g., collapse "AmazonMSK"/"Kafka" families)
+        lbl = canonize_to_master(lbl, is_source=(role == "SOURCE"))
+        out.append((lbl, _fmt_bytes(int(r.get("vol_bytes") or 0))))
+    return out
+
+
+def _add_metrics_section(doc, title, rows, headers):
+    _add_text(doc, title, size=12, bold=True)
+    if not rows:
+        _add_text(doc, "No Metrics Log data available yet.", size=10, italic=True)
+        return
+    _add_table(doc, headers=headers, rows=rows, style="Light Shading Accent 1")
+# ==== end Metrics helpers ======================================================
+
+
+
 def _pretty_type(raw: Any) -> str:
     if not raw:
         return "Unknown"
@@ -428,7 +544,7 @@ def _pretty_type(raw: Any) -> str:
         "Snowflake": "Snowflake",
         "Bigquery": "Google BigQuery",
         "Kafka": "",
-        "Filechannel": "File Channel",
+        "Filechannel": "File Channel endpoint",
         "Mysql": "MySQL",
         "Db2": "IBM DB2 for LUW",
         "Redshift": "Amazon Redshift",
@@ -451,7 +567,7 @@ def _type_icon(pretty: str) -> str:
         "Oracle (on-prem / Oracle Cloud)": "🟥",
         "Snowflake": "❄️",
         "Google BigQuery": "🔷",
-        "Kafka": "Kafka",
+        "Kafka": "",
         "File Channel endpoint": "📁",
         "MySQL": "🐬",
         "IBM DB2 for LUW": "🟣",
@@ -664,6 +780,182 @@ def _license_usage_section(doc: Document,
     doc.add_paragraph()
     _license_pill_table(doc, "Targets", sorted(used_tgt if lic_all_tgt else (used_tgt & lic_tgt_universe)), tgt_not_used)
 
+
+# ============================================================
+# Flow diagram helpers (customer-level and server-level)
+# ============================================================
+from tempfile import NamedTemporaryFile
+
+_FLOW_NOISE = {"na", "n/a", "null", "null target", "unknown", "(unknown)"}
+
+def _flow_is_noise(label: str) -> bool:
+    return (not label) or (label.strip().lower() in _FLOW_NOISE)
+
+def _flow_edges_from_coverage_rows(rows):
+    """rows with keys s_type, t_type, n -> list of (src, tgt, n) after pretty + noise filter"""
+    agg = {}
+    for r in rows or []:
+        s = _pretty_type(r.get("s_type"))
+        t = _pretty_type(r.get("t_type"))
+        if _flow_is_noise(s) or _flow_is_noise(t):
+            continue
+        n = int(r.get("n") or 0)
+        if n <= 0:
+            continue
+        key = (s.strip(), t.strip())
+        agg[key] = agg.get(key, 0) + n
+    return [(s, t, n) for (s, t), n in agg.items()]
+
+async def _gather_server_edges_map(conn, customer_id: int):
+    """
+    Returns {server_name: [(src, tgt, n), ...]}.
+    Prefers a view v_coverage_matrix_by_server if present; falls back to TSV group-by.
+    """
+    rows = await _try_all(
+        conn,
+        f"SELECT server_name, s_type, t_type, n FROM {SCHEMA}.v_coverage_matrix_by_server WHERE customer_id=%s",
+        (customer_id,),
+    )
+    if rows is None:
+        rows = await _all(
+            conn,
+            f"""
+            SELECT s.server_name,
+                   COALESCE(q.source_type,'(unknown)') AS s_type,
+                   COALESCE(q.target_type,'(unknown)') AS t_type,
+                   COUNT(*) AS n
+            FROM {SCHEMA}.qem_task_perf q
+            JOIN {SCHEMA}.dim_server s USING (server_id)
+            WHERE q.customer_id=%s
+            GROUP BY s.server_name, COALESCE(q.source_type,'(unknown)'), COALESCE(q.target_type,'(unknown)')
+            """,
+            (customer_id,),
+        )
+    by_server = {}
+    for r in rows or []:
+        sname = r.get("server_name")
+        if not sname:
+            continue
+        by_server.setdefault(sname, [])
+        by_server[sname].append({"s_type": r.get("s_type"), "t_type": r.get("t_type"), "n": r.get("n")})
+    # normalize + filter noise per server
+    out = {}
+    for sname, lst in by_server.items():
+        out[sname] = _flow_edges_from_coverage_rows(lst)
+    return out
+
+def _render_flow_png(edges, max_edges=20, width_inches=6.5):
+    """
+    Try Graphviz first; fall back to Matplotlib. Return PNG bytes or None.
+    """
+    # Order and cap edges
+    edges = sorted(edges or [], key=lambda e: (-int(e[2]), str(e[0]), str(e[1])))[:max_edges]
+    if not edges:
+        return None
+
+    # 1) Graphviz
+    try:
+        from graphviz import Digraph
+        g = Digraph("flows", format="png")
+        g.attr(rankdir="LR", splines="spline", fontname="Calibri")
+        g.attr("node", shape="box", style="rounded,filled", color="#4666A5", fillcolor="#EEF2FF", fontname="Calibri", fontsize="10")
+        g.attr("edge", color="#4E5D78", fontname="Calibri", fontsize="9")
+
+        sources = sorted({e[0] for e in edges})
+        targets = sorted({e[1] for e in edges})
+        max_n = max(int(e[2]) for e in edges) if edges else 1
+
+        with g.subgraph(name="cluster_sources") as ssg:
+            ssg.attr(rank="same", color="white")
+            for s in sources:
+                ssg.node(f"S::{s}", label=s)
+
+        with g.subgraph(name="cluster_targets") as tsg:
+            tsg.attr(rank="same", color="white")
+            for t in targets:
+                tsg.node(f"T::{t}", label=t)
+
+        for s, t, n in edges:
+            penw = 1 + (5 * (int(n) / max_n))
+            g.edge(f"S::{s}", f"T::{t}", label=str(n), penwidth=str(penw))
+
+        tmp = NamedTemporaryFile(suffix=".png", delete=False)
+        tmp.close()
+        out_path = tmp.name
+        g.render(filename=out_path, cleanup=True)  # graphviz appends .png
+        png_path = out_path + ".png"
+        with open(png_path, "rb") as f:
+            data = f.read()
+        try:
+            import os
+            os.remove(png_path)
+        except Exception:
+            pass
+        return data
+    except Exception:
+        pass
+
+    # 2) Matplotlib fallback
+    try:
+        import matplotlib.pyplot as plt
+        from matplotlib.patches import FancyBboxPatch, FancyArrowPatch
+
+        # layout
+        sources = sorted({e[0] for e in edges})
+        targets = sorted({e[1] for e in edges})
+        left_x, right_x = 0.05, 0.75
+        src_y_gap = 0.8 / max(1, len(sources))
+        tgt_y_gap = 0.8 / max(1, len(targets))
+        src_pos = {s: (left_x, 0.9 - i * src_y_gap) for i, s in enumerate(sources)}
+        tgt_pos = {t: (right_x, 0.9 - i * tgt_y_gap) for i, t in enumerate(targets)}
+
+        fig, ax = plt.subplots(figsize=(width_inches, 4.0))
+
+        def draw_node(ax, x, y, text):
+            w, h = 0.18, 0.06
+            box = FancyBboxPatch((x, y - h / 2), w, h, boxstyle="round,pad=0.02")
+            ax.add_patch(box)
+            ax.text(x + w / 2, y, text, ha="center", va="center", fontsize=9)
+
+        for s, (x, y) in src_pos.items():
+            draw_node(ax, x, y, s)
+        for t, (x, y) in tgt_pos.items():
+            draw_node(ax, x, y, t)
+
+        max_count = max(int(c) for _, _, c in edges) if edges else 1
+
+        for s, t, c in edges:
+            (x1, y1) = src_pos[s]
+            (x2, y2) = tgt_pos[t]
+            x1r = x1 + 0.18
+            x2l = x2
+            lw = 1 + 5 * (int(c) / max_count)
+            arrow = FancyArrowPatch((x1r, y1), (x2l, y2), arrowstyle="->", mutation_scale=12, linewidth=lw)
+            ax.add_patch(arrow)
+            xm = (x1r + x2l) / 2
+            ym = (y1 + y2) / 2
+            ax.text(xm, ym + 0.02, str(c), ha="center", va="bottom", fontsize=9)
+
+        ax.set_xlim(0, 1)
+        ax.set_ylim(0, 1)
+        ax.axis("off")
+
+        import io as _io
+        buf = _io.BytesIO()
+        fig.tight_layout()
+        fig.savefig(buf, format="png", dpi=180, bbox_inches="tight")
+        plt.close(fig)
+        buf.seek(0)
+        return buf.getvalue()
+    except Exception:
+        return None
+
+def _add_flow_png_to_doc(doc: Document, png_bytes: bytes, width_inches: float = 6.5):
+    from docx.shared import Inches
+    import io as _io
+    buf = _io.BytesIO(png_bytes)
+    doc.add_picture(buf, width=Inches(width_inches))
+
 # ============================================================
 # Server-level report (retained)
 # ============================================================
@@ -824,7 +1116,9 @@ async def generate_customer_report_docx(customer_name: str) -> Tuple[bytes, str]
                 """,
                 (customer_id,),
             )
-        version_map = {r["server_name"]: (r.get("replicate_version"), r.get("last_repo")) for r in version_rows}
+        version_map: Dict[str, Tuple[Optional[str], Optional[datetime]]] = {
+            r["server_name"]: (r.get("replicate_version"), r.get("last_repo")) for r in version_rows
+        }
 
         # Posture map
         posture_map: Dict[str, Tuple[str, int, str]] = {}
@@ -933,9 +1227,11 @@ async def generate_customer_report_docx(customer_name: str) -> Tuple[bytes, str]
                 tgt_types_repo = [r for r in types_repo if str(r.get("role")) == "TARGET"]
             src_rows_used = (src_types_tsv or src_types_repo)
             tgt_rows_used = (tgt_types_tsv or tgt_types_repo)
+            from_tsv = bool(src_types_tsv and tgt_types_tsv)
         else:
             src_rows_used = mix_src
             tgt_rows_used = mix_tgt
+            from_tsv = True  # view is derived from TSV ingestion
 
         # ---------- Peak volumes (TSV) ----------
         peak_fl = await _one(
@@ -1001,7 +1297,7 @@ async def generate_customer_report_docx(customer_name: str) -> Tuple[bytes, str]
                        lr.last_repo,
                        lq.last_qem
                 FROM {SCHEMA}.dim_server s
-                LEFT JOIN base     b  USING (server_id)
+                LEFT JOIN base      b  USING (server_id)
                 LEFT JOIN last_repo lr USING (server_id)
                 LEFT JOIN last_qem  lq USING (server_id)
                 WHERE s.customer_id=%s
@@ -1065,8 +1361,13 @@ async def generate_customer_report_docx(customer_name: str) -> Tuple[bytes, str]
         for r in coverage:
             cov_map[(_pretty_type(r["s_type"]), _pretty_type(r["t_type"]))] = int(r["n"])
 
+        # Build customer-level edges from coverage
+        customer_edges = _flow_edges_from_coverage_rows(coverage)
+
+        # Build per-server edges map
+        server_edges_map = await _gather_server_edges_map(conn, customer_id)
+
         # ---------- License coverage (use repmeta.v_license_vs_usage) ----------
-        # Prefer the DB view that already expands explicit tickers + wildcard "ALL" into families.
         # It exposes: customer_id, ef_role ('SOURCE'/'TARGET'), family_name, is_licensed (bool),
         # and configured_count (endpoints configured in rep_database mapped to that family).
         lic_rows = await _all(
@@ -1079,84 +1380,113 @@ async def generate_customer_report_docx(customer_name: str) -> Tuple[bytes, str]
             (customer_id,),
         )
 
+        # Always compute MIX/REPO-based 'used' as a fallback and merge later
+        mix_used_src = _names_from_rows(src_rows_used, is_source=True)
+        mix_used_tgt = _names_from_rows(tgt_rows_used, is_source=False)
         used_source_types, used_target_types = set(), set()
         lic_src, lic_tgt = set(), set()
 
         for r in (lic_rows or []):
-            fam = str(r.get("family_name") or "").strip()
+            fam_raw = str(r.get("family_name") or "").strip()
             role = str(r.get("ef_role") or "").strip().upper()
-            if not fam or not role:
+            if not fam_raw or not role:
                 continue
-            if bool(r.get("is_licensed")):
+            fam = canonize_to_master(fam_raw, is_source=(role=="SOURCE"))
+            # Collect licensed families
+            is_lic = r.get("is_licensed")
+            try:
+                is_lic_bool = bool(is_lic) if isinstance(is_lic, (bool, int)) else str(is_lic).strip().lower() in {"true","t","yes","y","1"}
+            except Exception:
+                is_lic_bool = False
+            if is_lic_bool:
                 if role == "SOURCE":
                     lic_src.add(fam)
                 elif role == "TARGET":
                     lic_tgt.add(fam)
-            if int(r.get("configured_count") or 0) > 0:
+            # Collect used from configured_count
+            try:
+                cfg_ct = int(r.get("configured_count") or 0)
+            except Exception:
+                cfg_ct = 0
+            if cfg_ct > 0:
                 if role == "SOURCE":
                     used_source_types.add(fam)
                 elif role == "TARGET":
                     used_target_types.add(fam)
 
+        # Merge MIX-based 'used' if LVU didn't report any
+        if not used_source_types:
+            used_source_types = set(mix_used_src)
+        else:
+            used_source_types |= set(mix_used_src)
+        if not used_target_types:
+            used_target_types = set(mix_used_tgt)
+        else:
+            used_target_types |= set(mix_used_tgt)
+
         # Determine whether the license effectively covers ALL families.
         lic_all_src = lic_src == set(MASTER_SOURCE_ENDPOINTS)
         lic_all_tgt = lic_tgt == set(MASTER_TARGET_ENDPOINTS)
 
-        # Fallback: if the view is missing/empty, fall back to previous behavior
-        if (not lic_rows):
+        # Fallbacks when LVU data is missing or empty (avoid 0/0 & blank panels)
+        if not lic_rows or (not lic_src and not lic_tgt):
             lic_row = await _one(
                 conn,
                 f"SELECT * FROM {SCHEMA}.v_latest_customer_license WHERE customer_id=%s",
                 (customer_id,),
             )
-            lic_all_src = bool(lic_row.get("licensed_all_sources")) if lic_row else False
-            lic_all_tgt = bool(lic_row.get("licensed_all_targets")) if lic_row else False
-            lic_src, lic_tgt = set(), set()
             if lic_row:
-                for s in (lic_row.get("licensed_sources") or []):
-                    lic_src.add(canonize_to_master(s, is_source=True))
-                for t in (lic_row.get("licensed_targets") or []):
-                    lic_tgt.add(canonize_to_master(t, is_source=False))
+                lic_all_src = bool(lic_row.get("licensed_all_sources"))
+                lic_all_tgt = bool(lic_row.get("licensed_all_targets"))
+                lic_src = set(canonize_to_master(s, True) for s in (lic_row.get("licensed_sources") or []))
+                lic_tgt = set(canonize_to_master(t, False) for t in (lic_row.get("licensed_targets") or []))
+            # If still empty, make the 'licensed universe' equal to what we can see in use
+            if not lic_src and used_source_types:
+                lic_src = set(used_source_types)
+                lic_all_src = False
+            if not lic_tgt and used_target_types:
+                lic_tgt = set(used_target_types)
+                lic_all_tgt = False
 
-            # Prior approach for "used" based on endpoint mix tables (already queried above)
-            used_source_types = _names_from_rows(src_rows_used, is_source=True)
-            used_target_types = _names_from_rows(tgt_rows_used, is_source=False)
-            top_tables_by_server: Dict[str, List[Tuple[str, int]]] = defaultdict(list)
-            # ---------- NEW: Top-5 tasks by #tables per server (precompute once) ----------
-            top_tables_rows = await _try_all(
-                conn,
-                f"""
-                WITH latest AS (
-                  SELECT server_id, MAX(created_at) AS last_ingest
-                  FROM {SCHEMA}.ingest_run
-                  WHERE customer_id=%s
-                  GROUP BY server_id
-                ),
-                counts AS (
-                  SELECT r.server_id, t.task_name, COUNT(*) AS n_tables
-                  FROM {SCHEMA}.rep_task_table tt
-                  JOIN {SCHEMA}.rep_task t ON t.task_id = tt.task_id AND t.run_id = tt.run_id
-                  JOIN {SCHEMA}.ingest_run r ON r.run_id = tt.run_id
-                  JOIN latest l
-                    ON l.server_id = r.server_id AND r.created_at = l.last_ingest
-                  GROUP BY r.server_id, t.task_name
-                ),
-                ranked AS (
-                  SELECT server_id, task_name, n_tables,
-                         ROW_NUMBER() OVER (PARTITION BY server_id ORDER BY n_tables DESC, task_name) AS rn
-                  FROM counts
-                )
-                SELECT s.server_name, task_name, n_tables
-                FROM ranked rk
-                JOIN {SCHEMA}.dim_server s ON s.server_id = rk.server_id
-                WHERE rk.rn <= 5 AND s.customer_id = %s
-                ORDER BY s.server_name, n_tables DESC, task_name
-                """,
-                (customer_id, customer_id),
+        # ---------- NEW: Top-5 tasks by #tables per server (precompute once) ----------
+        top_tables_by_server: Dict[str, List[Tuple[str, int]]] = defaultdict(list)
+        top_tables_rows = await _try_all(
+            conn,
+            f"""
+            WITH latest AS (
+              SELECT server_id, MAX(created_at) AS last_ingest
+              FROM {SCHEMA}.ingest_run
+              WHERE customer_id=%s
+              GROUP BY server_id
+            ),
+            counts AS (
+              SELECT r.server_id, t.task_name, COUNT(*) AS n_tables
+              FROM {SCHEMA}.rep_task_table tt
+              JOIN {SCHEMA}.rep_task t ON t.task_id = tt.task_id AND t.run_id = tt.run_id
+              JOIN {SCHEMA}.ingest_run r ON r.run_id = tt.run_id
+              JOIN latest l
+                ON l.server_id = r.server_id AND r.created_at = l.last_ingest
+              GROUP BY r.server_id, t.task_name
+            ),
+            ranked AS (
+              SELECT server_id, task_name, n_tables,
+                     ROW_NUMBER() OVER (PARTITION BY server_id ORDER BY n_tables DESC, task_name) AS rn
+              FROM counts
             )
-            if top_tables_rows:
-                for r in top_tables_rows:
+            SELECT s.server_name, task_name, n_tables
+            FROM ranked rk
+            JOIN {SCHEMA}.dim_server s ON s.server_id = rk.server_id
+            WHERE rk.rn <= 5 AND s.customer_id = %s
+            ORDER BY s.server_name, n_tables DESC, task_name
+            """,
+            (customer_id, customer_id),
+        )
+        if top_tables_rows:
+            for r in top_tables_rows:
+                try:
                     top_tables_by_server[r["server_name"]].append((r["task_name"], int(r["n_tables"])))
+                except Exception:
+                    pass
 
     # ---------------- DOCX BUILD ----------------
     doc = Document()
@@ -1193,7 +1523,7 @@ async def generate_customer_report_docx(customer_name: str) -> Tuple[bytes, str]
     doc.add_paragraph()
 
     # Endpoint Mix
-    _endpoint_mix_cards(doc, src_rows_used, tgt_rows_used, bool(src_rows_used and tgt_rows_used))
+    _endpoint_mix_cards(doc, src_rows_used, tgt_rows_used, bool(from_tsv))
     doc.add_paragraph()
 
     # License Usage - modern design (no "unlicensed in use")
@@ -1203,6 +1533,62 @@ async def generate_customer_report_docx(customer_name: str) -> Tuple[bytes, str]
         lic_all_src, lic_all_tgt,
         lic_src, lic_tgt,
     )
+    # Flow Diagram: Customer-level
+    _add_text(doc, "Flow Diagram: Source → Target (Task Counts)", size=12, bold=True)
+    try:
+        png = _render_flow_png(customer_edges, max_edges=20, width_inches=6.5)
+        if png:
+            _add_flow_png_to_doc(doc, png, width_inches=6.5)
+        else:
+            # Fallback to top flows table
+            top = sorted(customer_edges, key=lambda e: (-int(e[2]), e[0], e[1]))[:20]
+            _add_table(doc, headers=["Source", "Target", "Tasks"], rows=[(s,t,_fmt_int(n)) for s,t,n in top])
+    except Exception as e:
+        _add_text(doc, f"⚠ Flow diagram generation failed: {type(e).__name__}: {e}", size=10, italic=True)
+    
+    # ---- MetricsLog rollups (added) ----
+    # Open a FRESH connection for metrics rollups to avoid "connection is closed"
+    # if the earlier read-only block has been exited. We only read here.
+    try:
+        async with connection() as conn_metrics:
+            await _set_row_factory(conn_metrics)
+
+            try:
+                monthly = await _metrics_monthly_current_year(conn_metrics, customer_id)
+                _add_metrics_section(doc, f"Volume by Month (2025)",
+                                     monthly, headers=["Month","Load","CDC","Total"])
+            except Exception as e:
+                _add_text(doc, f"⚠ MetricsLog monthly summary failed: {type(e).__name__}: {e}", size=10, italic=True)
+
+            try:
+                yearly  = await _metrics_yearly_last5(conn_metrics, customer_id)
+                _add_metrics_section(doc, "Annual Volume (Last 5 Years)",
+                                     yearly, headers=["Year","Load","CDC","Total"])
+            except Exception as e:
+                _add_text(doc, f"⚠ MetricsLog annual summary failed: {type(e).__name__}: {e}", size=10, italic=True)
+
+            try:
+                top_tasks = await _metrics_top_tasks(conn_metrics, customer_id, limit=5)
+                _add_metrics_section(doc, "Top 5 Tasks by Volume (Load + CDC)",
+                                     top_tasks, headers=["Task","Server","Load","CDC","Total"])
+            except Exception as e:
+                _add_text(doc, f"⚠ MetricsLog top tasks failed: {type(e).__name__}: {e}", size=10, italic=True)
+
+            try:
+                top_src_load = await _metrics_top_endpoints(conn_metrics, customer_id, role="SOURCE", metric="load", limit=5)
+                top_src_cdc  = await _metrics_top_endpoints(conn_metrics, customer_id, role="SOURCE", metric="cdc",  limit=5)
+                top_tgt_load = await _metrics_top_endpoints(conn_metrics, customer_id, role="TARGET", metric="load", limit=5)
+                top_tgt_cdc  = await _metrics_top_endpoints(conn_metrics, customer_id, role="TARGET", metric="cdc",  limit=5)
+                _add_metrics_section(doc, "Top 5 Sources by Load Volume",  top_src_load, headers=["Source","Load"])
+                _add_metrics_section(doc, "Top 5 Sources by CDC Volume",   top_src_cdc,  headers=["Source","CDC"])
+                _add_metrics_section(doc, "Top 5 Targets by Load Volume",  top_tgt_load, headers=["Target","Load"])
+                _add_metrics_section(doc, "Top 5 Targets by CDC Volume",   top_tgt_cdc,  headers=["Target","CDC"])
+            except Exception as e:
+                _add_text(doc, f"⚠ MetricsLog endpoint leaders failed: {type(e).__name__}: {e}", size=10, italic=True)
+
+    except Exception as outer_e:
+        _add_text(doc, f"⚠ MetricsLog summary failed: {type(outer_e).__name__}: {outer_e}", size=10, italic=True)
+
     doc.add_page_break()
 
     # 2) Customer Insights
@@ -1265,13 +1651,13 @@ async def generate_customer_report_docx(customer_name: str) -> Tuple[bytes, str]
                 (customer_id, customer_id),
             )
         if tasks_null_tgt:
-            _add_text(doc, "Tasks with missing Target Type", size=11, bold=True)
+            _add_text(doc, "Tasks with Null Target Type", size=11, bold=True)
             headers = ["Server", "Task", "Target Endpoint"]
             rows = [(r.get("server_name") or "-", r.get("task_name") or "-", r.get("target_name") or "-")
                     for r in tasks_null_tgt]
             _add_table(doc, headers=headers, rows=rows, style="Light Shading")
         else:
-            _add_text(doc, "No tasks with missing Target Type found in latest QEM snapshot.", size=10, italic=True)
+            _add_text(doc, "No tasks with Null Target Type found in latest QEM snapshot.", size=10, italic=True)
     except Exception as e:
         _add_text(doc, f"⚠ Insight #1 failed: {type(e).__name__}: {e}", size=10, italic=True)
 
@@ -1401,12 +1787,59 @@ async def generate_customer_report_docx(customer_name: str) -> Tuple[bytes, str]
     except Exception as e:
         _add_text(doc, f"⚠ Insight #2 failed: {type(e).__name__}: {e}", size=10, italic=True)
 
+    
+    # Tasks with DEBUG loggers (latest repo ingest per server)
+    _add_text(doc, "Tasks with DEBUG Loggers (latest repo ingest per server)", size=11, bold=True)
+    try:
+        async with connection() as conn_ro_debug:
+            await _set_row_factory(conn_ro_debug)
+            rows = await _all(
+                conn_ro_debug,
+                f"""
+                WITH latest AS (
+                  SELECT server_id, MAX(created_at) AS last_ingest
+                  FROM {SCHEMA}.ingest_run
+                  WHERE customer_id=%s
+                  GROUP BY server_id
+                ),
+                runs AS (
+                  SELECT r.server_id, r.run_id
+                  FROM latest l
+                  JOIN {SCHEMA}.ingest_run r
+                    ON r.server_id=l.server_id AND r.created_at=l.last_ingest
+                )
+                SELECT s.server_name,
+                       t.task_name,
+                       STRING_AGG(l.logger_name, ', ' ORDER BY l.logger_name) AS debug_loggers
+                FROM {SCHEMA}.rep_task_logger l
+                JOIN {SCHEMA}.rep_task t
+                  ON t.task_id=l.task_id AND t.run_id=l.run_id
+                JOIN runs r ON r.run_id=t.run_id
+                JOIN {SCHEMA}.dim_server s ON s.server_id=t.server_id
+                WHERE t.customer_id=%s AND UPPER(l.level)='DEBUG'
+                GROUP BY s.server_name, t.task_name
+                ORDER BY s.server_name, t.task_name
+                """,
+                (customer_id, customer_id),
+            )
+        if rows:
+            _add_table(
+                doc,
+                headers=["Server", "Task", "Logger(s) at DEBUG"],
+                rows=[(r.get("server_name","-"), r.get("task_name","-"), r.get("debug_loggers","-")) for r in rows],
+                style="Light Shading",
+            )
+        else:
+            _add_text(doc, "No tasks found with DEBUG loggers in the latest ingest.", size=10, italic=True)
+    except Exception as e:
+        _add_text(doc, f"⚠ DEBUG logger insight failed: {type(e).__name__}: {e}", size=10, italic=True)
+
     doc.add_page_break()
 
     # 3) Environment & Inventory
     _add_heading(doc, "3. Environment & Inventory", 1)
     _add_text(doc, "Servers Overview", size=12, bold=True)
-    headers = ["Server", "Tasks", "Source EPs", "Target EPs", "Last Repo Ingest", "Last QEM Ingest", "Replicate", "Posture"]
+    headers = ["Server", "Tasks", "Source EPs", "Target EPs", "Replicate", "Posture"]
     rows = []
     for r in rollup_rows:
         sname = r.get("server_name")
@@ -1416,8 +1849,6 @@ async def generate_customer_report_docx(customer_name: str) -> Tuple[bytes, str]
             _fmt_int(r.get("tasks")),
             _fmt_int(r.get("src_eps")),
             _fmt_int(r.get("tgt_eps")),
-            _age_badge(r.get("last_repo")),
-            _age_badge(r.get("last_qem")),
             _version_badge(ver_str),
             label,
         ])
@@ -1426,7 +1857,7 @@ async def generate_customer_report_docx(customer_name: str) -> Tuple[bytes, str]
 
     # Coverage Matrix
     _add_text(doc, "Source × Target Coverage (TSV)", size=12, bold=True)
-    headers = ["Source \\ Target"] + [f"{_type_icon(t)}  {t}" for t in tgt_types]
+    headers = ["Source \\ Target"] + [(f"{_type_icon(t)}  {t}" if _type_icon(t) else t) for t in tgt_types]
     rows = []
     for s_type in src_types:
         row = [(f"{_type_icon(s_type)}  {s_type}" if _type_icon(s_type) else s_type)]
@@ -1464,6 +1895,19 @@ async def generate_customer_report_docx(customer_name: str) -> Tuple[bytes, str]
             )
         else:
             _add_text(doc, "Top-5 tasks by number of tables — no table data found for latest ingest.", size=10, italic=True)
+
+        # Per-server flow diagram
+        _add_text(doc, "Flow Diagram: Source → Target (Task Counts)", size=11, bold=True)
+        try:
+            edges = server_edges_map.get(s, [])
+            png = _render_flow_png(edges, max_edges=12, width_inches=6.3)
+            if png:
+                _add_flow_png_to_doc(doc, png, width_inches=6.3)
+            else:
+                top = sorted(edges, key=lambda e: (-int(e[2]), e[0], e[1]))[:12]
+                _add_table(doc, headers=["Source", "Target", "Tasks"], rows=[(ss,tt,_fmt_int(nn)) for ss,tt,nn in top])
+        except Exception as e:
+            _add_text(doc, f"⚠ Server flow diagram failed: {type(e).__name__}: {e}", size=10, italic=True)
 
         doc.add_paragraph()
 

@@ -17,7 +17,8 @@ from .export_report import (
     generate_summary_docx,         # (server-scoped; kept for backward-compat)
     generate_customer_report_docx, # customer-wide report
 )
-from .ingest import ingest_repository  # expects (repo_json, customer_name, server_name)
+# ✅ Patched earlier: include ingest_metrics_log import
+from .ingest import ingest_repository, ingest_metrics_log  # expects (repo_json, customer_name, server_name)
 from .license_routes import router as license_router  # license upload routes
 
 LOG = logging.getLogger("api")
@@ -457,16 +458,60 @@ async def ingest_qem_servers_file(
         raise HTTPException(status_code=500, detail=f"QEM servers map ingest failed: {e}")
 
 
+# ---------------- Metrics purge helper (NEW) ----------------
+async def _purge_metrics_for_customer(conn, customer_id: int) -> dict[str, int]:
+    """
+    Delete all metrics-log data for a customer in correct dependency order:
+    1) rep_metrics_event -> 2) rep_metrics_run
+    """
+    counts: dict[str, int] = {}
+    # Delete events tied to the customer's metrics runs
+    cur = await conn.execute(
+        f"""
+        WITH m_runs AS (
+          SELECT metrics_run_id
+          FROM {SCHEMA}.rep_metrics_run
+          WHERE customer_id = %s
+        )
+        DELETE FROM {SCHEMA}.rep_metrics_event e
+        USING m_runs mr
+        WHERE e.metrics_run_id = mr.metrics_run_id
+        """,
+        (customer_id,),
+    )
+    try:
+        counts["rep_metrics_event"] = cur.rowcount or 0
+    except Exception:
+        counts["rep_metrics_event"] = 0
+
+    # Delete the runs
+    cur = await conn.execute(
+        f"DELETE FROM {SCHEMA}.rep_metrics_run WHERE customer_id = %s",
+        (customer_id,),
+    )
+    try:
+        counts["rep_metrics_run"] = cur.rowcount or 0
+    except Exception:
+        counts["rep_metrics_run"] = 0
+
+    return counts
+
+
 # ---------------- Cleanup ---------------
 @app.delete("/customers/{customer_id}/data")
 async def delete_customer_data(customer_id: int, drop_servers: bool = True):
     """
     Delete all ingested data for a customer (keeps the dim_customer row).
+    Includes repo, QEM, and metrics-log data.
     """
     try:
         async with connection() as conn:
             async with conn.transaction():
                 deleted: dict[str, int] = {}
+
+                # 0) NEW: Metrics Log data (events -> runs)
+                metrics_counts = await _purge_metrics_for_customer(conn, customer_id)
+                deleted.update(metrics_counts)
 
                 # 1) QEM metrics
                 r = await conn.execute(
@@ -562,8 +607,30 @@ async def delete_customer_data(customer_id: int, drop_servers: bool = True):
 
                 msg = ", ".join(f"{k}={v}" for k, v in deleted.items())
                 logging.getLogger("api").info("Customer %s cleanup: %s", customer_id, msg)
-                return {"ok": True, "deleted_summary": msg}
+                return {"ok": True, "deleted_summary": msg, "deleted": deleted}
 
     except Exception as e:
         logging.getLogger("api").exception("Cleanup failed for customer_id=%s", customer_id)
         raise HTTPException(status_code=500, detail=f"Cleanup failed: {e}")
+
+# --- Replicate Metrics Log (multipart file) ---
+@app.post("/ingest-metrics-log")
+async def ingest_metrics_log_file(
+    file: UploadFile = File(...),
+    customer_name: str = Form(...),
+    server_name: str = Form(...),   # user must pick the Replicate server
+):
+    try:
+        raw = await file.read()
+        res = await ingest_metrics_log(
+            data_bytes=raw,
+            customer_name=customer_name.strip(),
+            server_name=server_name.strip(),
+            file_name=file.filename or "metricsLog.tsv",
+        )
+        return res
+    except HTTPException:
+        raise
+    except Exception as e:
+        log.exception("INGEST /ingest-metrics-log failed")
+        raise HTTPException(status_code=400, detail=str(e))

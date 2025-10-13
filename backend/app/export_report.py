@@ -4,7 +4,7 @@ import os
 import re
 import logging
 from collections import defaultdict
-from datetime import datetime, timezone
+from datetime import datetime, timezone, date
 from typing import Any, Dict, List, Tuple, Optional, NamedTuple
 
 import httpx  # used to fetch latest GA train from GitHub
@@ -379,6 +379,225 @@ def _fmt_int(x: Any) -> str:
     except Exception:
         return str(x)
 
+# ==== Metrics helpers (added) ==================================================
+def _fmt_bytes(n: float) -> str:
+    try:
+        x = float(n or 0)
+    except Exception:
+        return str(n)
+    units = ["B","KB","MB","GB","TB","PB"]
+    k = 1000.0
+    i = 0
+    while x >= k and i < len(units)-1:
+        x /= k
+        i += 1
+    if i == 0:
+        return f"{int(x)} {units[i]}"
+    return f"{x:.1f} {units[i]}"
+
+async def _metrics_monthly_current_year(conn, customer_id: int):
+    """
+    NOW: Return monthly LOAD/CDC totals for the LAST 6 MONTHS,
+    anchored to the latest month present in the latest metrics-log
+    run per (customer, server).
+
+    Rules:
+    - Use only the latest rep_metrics_run per server for the customer.
+    - Consider only STOP/OK events.
+    - Find the max month across those events; include that month + previous 5 months.
+    - Sum by month; return humanized bytes.
+    """
+    sql = f"""
+        WITH latest_runs AS (
+          SELECT DISTINCT ON (server_id)
+                 metrics_run_id, server_id
+          FROM {SCHEMA}.rep_metrics_run
+          WHERE customer_id = %s
+          ORDER BY server_id, created_at DESC NULLS LAST, metrics_run_id DESC
+        ),
+        events AS (
+          SELECT COALESCE(e.stop_ts, e.start_ts) AS ts,
+                 COALESCE(e.load_bytes,0)::bigint AS load_b,
+                 COALESCE(e.cdc_bytes,0)::bigint  AS cdc_b
+          FROM {SCHEMA}.rep_metrics_event e
+          JOIN latest_runs lr ON lr.metrics_run_id = e.metrics_run_id
+          WHERE UPPER(COALESCE(e.event_type,'')) = 'STOP'
+            AND UPPER(COALESCE(e.status,'OK'))   = 'OK'
+        ),
+        bounds AS (
+          SELECT date_trunc('month', MAX(ts)) AS max_month
+          FROM events
+        ),
+        filtered AS (
+          SELECT date_trunc('month', e.ts)::date AS m, e.load_b, e.cdc_b
+          FROM events e
+          JOIN bounds b ON TRUE
+          WHERE e.ts >= (b.max_month - INTERVAL '5 months')
+            AND e.ts  < (b.max_month + INTERVAL '1 month')
+        )
+        SELECT m,
+               SUM(load_b)::bigint AS load_b,
+               SUM(cdc_b)::bigint  AS cdc_b
+        FROM filtered
+        GROUP BY m
+        ORDER BY m;
+    """
+    rows = await _try_all(conn, sql, (customer_id,)) or []
+
+    # If no events exist at all (no latest runs or no STOP/OK rows), return empty.
+    if not rows:
+        return []
+
+    out = []
+    for r in rows:
+        m  = r["m"]  # date
+        lb = int(r.get("load_b") or 0)
+        cb = int(r.get("cdc_b") or 0)
+        out.append((str(m), _fmt_bytes(lb), _fmt_bytes(cb), _fmt_bytes(lb + cb)))
+    return out
+
+
+
+async def _metrics_yearly_last5(conn, customer_id: int):
+    sql = f"""
+        WITH latest_runs AS (
+          SELECT DISTINCT ON (server_id)
+                 metrics_run_id, server_id
+          FROM {SCHEMA}.rep_metrics_run
+          WHERE customer_id = %s
+          ORDER BY server_id, created_at DESC NULLS LAST, metrics_run_id DESC
+        )
+        SELECT date_part('year', COALESCE(e.stop_ts, e.start_ts))::int AS y,
+               COALESCE(SUM(e.load_bytes),0)::bigint AS load_b,
+               COALESCE(SUM(e.cdc_bytes),0)::bigint  AS cdc_b
+        FROM {SCHEMA}.rep_metrics_event e
+        JOIN latest_runs lr ON lr.metrics_run_id = e.metrics_run_id
+        WHERE UPPER(COALESCE(e.event_type,'')) = 'STOP'
+          AND UPPER(COALESCE(e.status,'OK'))   = 'OK'
+          AND date_part('year', COALESCE(e.stop_ts, e.start_ts)) >= date_part('year', CURRENT_DATE) - 4
+        GROUP BY 1
+        ORDER BY 1;
+    """
+    rows = await _try_all(conn, sql, (customer_id,)) or []
+    out = []
+    for r in rows:
+        y  = int(r["y"])
+        lb = int(r.get("load_b") or 0)
+        cb = int(r.get("cdc_b") or 0)
+        out.append((str(y), _fmt_bytes(lb), _fmt_bytes(cb), _fmt_bytes(lb + cb)))
+    return out
+
+
+async def _metrics_top_tasks(conn, customer_id: int, limit: int = 5):
+    sql = f"""
+        WITH latest_runs AS (
+          SELECT DISTINCT ON (server_id)
+                 metrics_run_id, server_id
+          FROM {SCHEMA}.rep_metrics_run
+          WHERE customer_id = %s
+          ORDER BY server_id, created_at DESC NULLS LAST, metrics_run_id DESC
+        ),
+        agg AS (
+          SELECT lr.server_id, e.task_id, e.task_uuid,
+                 COALESCE(SUM(e.load_bytes),0)::bigint AS load_b,
+                 COALESCE(SUM(e.cdc_bytes),0)::bigint  AS cdc_b
+          FROM {SCHEMA}.rep_metrics_event e
+          JOIN latest_runs lr ON lr.metrics_run_id = e.metrics_run_id
+          WHERE UPPER(COALESCE(e.event_type,'')) = 'STOP'
+            AND UPPER(COALESCE(e.status,'OK'))   = 'OK'
+          GROUP BY 1,2,3
+        ),
+        name_resolved AS (
+          SELECT a.server_id, a.task_id, a.task_uuid, a.load_b, a.cdc_b,
+                 COALESCE(t.task_name, NULL) AS task_name
+          FROM agg a
+          LEFT JOIN LATERAL (
+            SELECT rt.task_name
+            FROM {SCHEMA}.rep_task rt
+            JOIN {SCHEMA}.ingest_run ir2 ON ir2.run_id = rt.run_id
+            WHERE ir2.customer_id = %s
+              AND ((a.task_id  IS NOT NULL AND rt.task_id  = a.task_id)
+                OR (a.task_uuid IS NOT NULL AND rt.task_uuid = a.task_uuid))
+            ORDER BY rt.run_id DESC
+            LIMIT 1
+          ) t ON TRUE
+        )
+        SELECT ds.server_name,
+               COALESCE(n.task_name, NULL) AS task_name,
+               n.task_uuid, n.load_b, n.cdc_b,
+               (n.load_b + n.cdc_b) AS total_b
+        FROM name_resolved n
+        JOIN {SCHEMA}.dim_server ds ON ds.server_id = n.server_id
+        ORDER BY total_b DESC NULLS LAST
+        LIMIT {limit};
+    """
+    rows = await _try_all(conn, sql, (customer_id, customer_id)) or []
+    out = []
+    for r in rows:
+        name = r.get("task_name") or f"(unknown) {(r.get('task_uuid') or '')[:8]}"
+        srv  = r.get("server_name") or ""
+        lb   = int(r.get("load_b") or 0)
+        cb   = int(r.get("cdc_b") or 0)
+        out.append((name, srv, _fmt_bytes(lb), _fmt_bytes(cb), _fmt_bytes(lb + cb)))
+    return out
+
+
+async def _metrics_top_endpoints(conn, customer_id: int, role: str, metric: str, limit: int = 5):
+    """
+    Top endpoints using only the latest metrics-log run per server.
+    role   : "SOURCE" | "TARGET"
+    metric : "load" | "cdc"
+    """
+    assert role in ("SOURCE", "TARGET")
+    assert metric in ("load", "cdc")
+
+    byte_col   = "load_bytes" if metric == "load" else "cdc_bytes"
+    fam_id_col = "source_family_id" if role == "SOURCE" else "target_family_id"
+    type_col   = "source_type"      if role == "SOURCE" else "target_type"
+
+    sql = f"""
+        WITH latest_runs AS (
+          SELECT DISTINCT ON (server_id)
+                 metrics_run_id, server_id
+          FROM {SCHEMA}.rep_metrics_run
+          WHERE customer_id = %s
+          ORDER BY server_id, created_at DESC NULLS LAST, metrics_run_id DESC
+        )
+        SELECT
+            COALESCE(f.family_name, e.{type_col}) AS endpoint_label,
+            COALESCE(SUM(e.{byte_col}), 0)::bigint AS vol_bytes
+        FROM {SCHEMA}.rep_metrics_event e
+        JOIN latest_runs lr ON lr.metrics_run_id = e.metrics_run_id
+        LEFT JOIN {SCHEMA}.endpoint_family f ON f.family_id = e.{fam_id_col}
+        WHERE UPPER(COALESCE(e.event_type,'')) = 'STOP'
+          AND UPPER(COALESCE(e.status,'OK'))   = 'OK'
+        GROUP BY 1
+        ORDER BY vol_bytes DESC NULLS LAST
+        LIMIT {limit};
+    """
+
+    rows = await _try_all(conn, sql, (customer_id,)) or []
+    out = []
+    for r in rows:
+        lbl = r.get("endpoint_label")
+        if not lbl:
+            continue
+        lbl = canonize_to_master(lbl, is_source=(role == "SOURCE"))
+        out.append((lbl, _fmt_bytes(int(r.get("vol_bytes") or 0))))
+    return out
+
+
+
+def _add_metrics_section(doc, title, rows, headers):
+    _add_text(doc, title, size=12, bold=True)
+    if not rows:
+        _add_text(doc, "No Metrics Log data available yet.", size=10, italic=True)
+        return
+    _add_table(doc, headers=headers, rows=rows, style="Light Shading Accent 1")
+# ==== end Metrics helpers ======================================================
+
+
+
 def _pretty_type(raw: Any) -> str:
     if not raw:
         return "Unknown"
@@ -629,6 +848,26 @@ def _license_usage_section(doc: Document,
 
 # ============================================================
 # Flow diagram helpers (customer-level and server-level)
+def _add_flow_pair_table(doc: Document, edges, title: str, max_rows: int = 500):
+    """Render a simple three-column table sorted by Tasks desc: [Source | Target | Tasks]"""
+    _add_text(doc, title, size=12, bold=True)
+    if not edges:
+        _add_text(doc, "No flow data available.", size=10, italic=True)
+        return
+    # Aggregate duplicate pairs and sanitize
+    agg = {}
+    for s, t, n in (edges or []):
+        try:
+            key = (str(s).strip(), str(t).strip())
+            agg[key] = agg.get(key, 0) + int(n or 0)
+        except Exception:
+            continue
+    rows_data = [(s, t, n) for (s, t), n in agg.items()]
+    rows_data.sort(key=lambda e: (-int(e[2]), str(e[0]), str(e[1])))
+    headers = ["Source", "Target", "Tasks"]
+    rows = [(s, t, _fmt_int(n)) for s, t, n in rows_data[:max_rows]]
+    _add_table(doc, headers=headers, rows=rows, style="Light Shading Accent 1")
+
 # ============================================================
 from tempfile import NamedTemporaryFile
 
@@ -1379,18 +1618,52 @@ async def generate_customer_report_docx(customer_name: str) -> Tuple[bytes, str]
         lic_all_src, lic_all_tgt,
         lic_src, lic_tgt,
     )
-    # Flow Diagram: Customer-level
-    _add_text(doc, "Flow Diagram: Source → Target (Task Counts)", size=12, bold=True)
+        # Flow Table: Customer-level (forced table)
+    _add_flow_pair_table(doc, customer_edges, "Source → Target (Task Counts)")
+    
+    # ---- MetricsLog rollups (added) ----
+    # Open a FRESH connection for metrics rollups to avoid "connection is closed"
+    # if the earlier read-only block has been exited. We only read here.
     try:
-        png = _render_flow_png(customer_edges, max_edges=20, width_inches=6.5)
-        if png:
-            _add_flow_png_to_doc(doc, png, width_inches=6.5)
-        else:
-            # Fallback to top flows table
-            top = sorted(customer_edges, key=lambda e: (-int(e[2]), e[0], e[1]))[:20]
-            _add_table(doc, headers=["Source", "Target", "Tasks"], rows=[(s,t,_fmt_int(n)) for s,t,n in top])
-    except Exception as e:
-        _add_text(doc, f"⚠ Flow diagram generation failed: {type(e).__name__}: {e}", size=10, italic=True)
+        async with connection() as conn_metrics:
+            await _set_row_factory(conn_metrics)
+
+            try:
+                monthly = await _metrics_monthly_current_year(conn_metrics, customer_id)
+                _add_metrics_section(doc, f"Monthly Volume (Last 6 Months)",
+                                     monthly, headers=["Month","Load","CDC","Total"])
+            except Exception as e:
+                _add_text(doc, f"⚠ MetricsLog monthly summary failed: {type(e).__name__}: {e}", size=10, italic=True)
+
+            try:
+                yearly  = await _metrics_yearly_last5(conn_metrics, customer_id)
+                _add_metrics_section(doc, "Annual Volume (Last 5 Years)",
+                                     yearly, headers=["Year","Load","CDC","Total"])
+            except Exception as e:
+                _add_text(doc, f"⚠ MetricsLog annual summary failed: {type(e).__name__}: {e}", size=10, italic=True)
+
+            try:
+                top_tasks = await _metrics_top_tasks(conn_metrics, customer_id, limit=5)
+                _add_metrics_section(doc, "Top 5 Tasks by Volume (Load + CDC)",
+                                     top_tasks, headers=["Task","Server","Load","CDC","Total"])
+            except Exception as e:
+                _add_text(doc, f"⚠ MetricsLog top tasks failed: {type(e).__name__}: {e}", size=10, italic=True)
+
+            try:
+                top_src_load = await _metrics_top_endpoints(conn_metrics, customer_id, role="SOURCE", metric="load", limit=5)
+                top_src_cdc  = await _metrics_top_endpoints(conn_metrics, customer_id, role="SOURCE", metric="cdc",  limit=5)
+                top_tgt_load = await _metrics_top_endpoints(conn_metrics, customer_id, role="TARGET", metric="load", limit=5)
+                top_tgt_cdc  = await _metrics_top_endpoints(conn_metrics, customer_id, role="TARGET", metric="cdc",  limit=5)
+                _add_metrics_section(doc, "Top 5 Sources by Load Volume",  top_src_load, headers=["Source","Load"])
+                _add_metrics_section(doc, "Top 5 Sources by CDC Volume",   top_src_cdc,  headers=["Source","CDC"])
+                _add_metrics_section(doc, "Top 5 Targets by Load Volume",  top_tgt_load, headers=["Target","Load"])
+                _add_metrics_section(doc, "Top 5 Targets by CDC Volume",   top_tgt_cdc,  headers=["Target","CDC"])
+            except Exception as e:
+                _add_text(doc, f"⚠ MetricsLog endpoint leaders failed: {type(e).__name__}: {e}", size=10, italic=True)
+
+    except Exception as outer_e:
+        _add_text(doc, f"⚠ MetricsLog summary failed: {type(outer_e).__name__}: {outer_e}", size=10, italic=True)
+
     doc.add_page_break()
 
     # 2) Customer Insights
@@ -1659,7 +1932,7 @@ async def generate_customer_report_docx(customer_name: str) -> Tuple[bytes, str]
 
     # Coverage Matrix
     _add_text(doc, "Source × Target Coverage (TSV)", size=12, bold=True)
-    headers = ["Source \ Target"] + [(f"{_type_icon(t)}  {t}" if _type_icon(t) else t) for t in tgt_types]
+    headers = ["Source \\ Target"] + [(f"{_type_icon(t)}  {t}" if _type_icon(t) else t) for t in tgt_types]
     rows = []
     for s_type in src_types:
         row = [(f"{_type_icon(s_type)}  {s_type}" if _type_icon(s_type) else s_type)]
@@ -1698,18 +1971,9 @@ async def generate_customer_report_docx(customer_name: str) -> Tuple[bytes, str]
         else:
             _add_text(doc, "Top-5 tasks by number of tables — no table data found for latest ingest.", size=10, italic=True)
 
-        # Per-server flow diagram
-        _add_text(doc, "Flow Diagram: Source → Target (Task Counts)", size=11, bold=True)
-        try:
-            edges = server_edges_map.get(s, [])
-            png = _render_flow_png(edges, max_edges=12, width_inches=6.3)
-            if png:
-                _add_flow_png_to_doc(doc, png, width_inches=6.3)
-            else:
-                top = sorted(edges, key=lambda e: (-int(e[2]), e[0], e[1]))[:12]
-                _add_table(doc, headers=["Source", "Target", "Tasks"], rows=[(ss,tt,_fmt_int(nn)) for ss,tt,nn in top])
-        except Exception as e:
-            _add_text(doc, f"⚠ Server flow diagram failed: {type(e).__name__}: {e}", size=10, italic=True)
+                # Per-server flow table (forced table)
+        edges = server_edges_map.get(s, [])
+        _add_flow_pair_table(doc, edges, "Source → Target (Task Counts)")
 
         doc.add_paragraph()
 

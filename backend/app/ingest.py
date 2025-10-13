@@ -3,6 +3,9 @@ import json
 import logging
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple, Set
+from decimal import Decimal
+import csv
+import io
 
 from psycopg.rows import dict_row
 
@@ -75,6 +78,74 @@ def _extract_replicate_version(payload: Dict[str, Any]) -> Optional[str]:
     except Exception:
         pass
     return None
+
+
+# ---- new helpers for task-settings ----
+def _sub(d: Dict[str, Any], *path) -> Dict[str, Any]:
+    """Return nested dict or {} if missing/not a dict."""
+    cur = d or {}
+    for p in path:
+        v = cur.get(p)
+        if not isinstance(v, dict):
+            return {}
+        cur = v
+    return cur
+
+
+def _flatten(prefix: str, obj: Any):
+    """
+    Yield (full_path, type, bool, num, text, json) for rep_task_settings_kv.
+    """
+    if obj is None:
+        return
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            p = f"{prefix}.{k}" if prefix else k
+            yield from _flatten(p, v)
+    elif isinstance(obj, list):
+        yield (prefix, "json", None, None, None, obj)
+    elif isinstance(obj, bool):
+        yield (prefix, "bool", obj, None, None, None)
+    elif isinstance(obj, (int, float, Decimal)):
+        yield (prefix, "num", None, Decimal(str(obj)), None, None)
+    elif isinstance(obj, str):
+        yield (prefix, "text", None, None, obj, None)
+    else:
+        yield (prefix, "json", None, None, None, obj)
+
+
+async def _exec(conn, sql: str, params: tuple):
+    """
+    Execute with best-effort logging; never break ingest if schema drifts.
+    """
+    try:
+        await conn.execute(sql, params)
+    except Exception as e:
+        LOG.debug(
+            "Non-fatal settings insert skipped: %s | SQL=%s | params(head)=%s",
+            e, sql[:90], params[:3] if isinstance(params, tuple) else "?"
+        )
+
+
+# NEW: safe bulk insert
+async def _bulk_insert(conn, sql: str, rows: List[Tuple[Any, ...]]) -> None:
+    """
+    Try connection.executemany(sql, rows). If not available (common for async wrappers),
+    fall back to per-row execute inside a short transaction. Always batches in its own txn.
+    """
+    try:
+        em = getattr(conn, "executemany", None)
+        if callable(em):
+            async with conn.transaction():
+                await em(sql, rows)
+            return
+    except Exception:
+        # fall through to per-row execution
+        pass
+
+    async with conn.transaction():
+        for params in rows:
+            await conn.execute(sql, params)
 
 
 # ------------------------------
@@ -817,6 +888,546 @@ async def _insert_task_loggers(conn, run_id: int, task_id: int, task_obj: Dict[s
 
 
 # ------------------------------
+# NEW: Task settings – sections / normalized / KV
+# ------------------------------
+async def _upsert_task_settings_sections(conn, run_id: int, task_id: int, tset: Dict[str, Any]):
+    for sec in ("common_settings", "target_settings", "source_settings", "sorter_settings"):
+        body = _sub(tset, sec)
+        await _exec(
+            conn,
+            f"""INSERT INTO {SCHEMA}.rep_task_settings_section(task_id, run_id, section_path, body)
+                VALUES (%s,%s,%s,%s)
+                ON CONFLICT (task_id, section_path) DO UPDATE
+                SET run_id=EXCLUDED.run_id, body=EXCLUDED.body""",
+            (task_id, run_id, f"task_settings.{sec}", json.dumps(body, ensure_ascii=False)),
+        )
+
+
+async def _upsert_task_settings_common(conn, run_id: int, task_id: int, cs: Dict[str, Any]):
+    sql = f"""INSERT INTO {SCHEMA}.rep_task_settings_common(
+                task_id, run_id,
+                write_full_logging,
+                status_table_name, suspended_tables_table_name, exception_table_name,
+                save_changes_enabled,
+                batch_apply_memory_limit, batch_apply_timeout, batch_apply_timeout_min,
+                status_table_enabled, suspended_tables_table_enabled, history_table_enabled,
+                exception_table_enabled, recovery_table_enabled, ddl_history_table_enabled,
+                batch_apply_use_parallel_bulk, parallel_bulk_max_num_threads, batch_optimize_by_merge,
+                use_inserts_for_status_table_updates, task_uuid)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+            ON CONFLICT (task_id) DO UPDATE SET
+                run_id=EXCLUDED.run_id,
+                write_full_logging=EXCLUDED.write_full_logging,
+                status_table_name=EXCLUDED.status_table_name,
+                suspended_tables_table_name=EXCLUDED.suspended_tables_table_name,
+                exception_table_name=EXCLUDED.exception_table_name,
+                save_changes_enabled=EXCLUDED.save_changes_enabled,
+                batch_apply_memory_limit=EXCLUDED.batch_apply_memory_limit,
+                batch_apply_timeout=EXCLUDED.batch_apply_timeout,
+                batch_apply_timeout_min=EXCLUDED.batch_apply_timeout_min,
+                status_table_enabled=EXCLUDED.status_table_enabled,
+                suspended_tables_table_enabled=EXCLUDED.suspended_tables_table_enabled,
+                history_table_enabled=EXCLUDED.history_table_enabled,
+                exception_table_enabled=EXCLUDED.exception_table_enabled,
+                recovery_table_enabled=EXCLUDED.recovery_table_enabled,
+                ddl_history_table_enabled=EXCLUDED.ddl_history_table_enabled,
+                batch_apply_use_parallel_bulk=EXCLUDED.batch_apply_use_parallel_bulk,
+                parallel_bulk_max_num_threads=EXCLUDED.parallel_bulk_max_num_threads,
+                batch_optimize_by_merge=EXCLUDED.batch_optimize_by_merge,
+                use_inserts_for_status_table_updates=EXCLUDED.use_inserts_for_status_table_updates,
+                task_uuid=EXCLUDED.task_uuid
+        """
+    await _exec(conn, sql, (
+        task_id, run_id,
+        _norm_bool(cs.get("write_full_logging")),
+        None, None, None,
+        _norm_bool(cs.get("save_changes_enabled")),
+        cs.get("batch_apply_memory_limit"),
+        cs.get("batch_apply_timeout"),
+        cs.get("batch_apply_timeout_min"),
+        _norm_bool(cs.get("status_table_enabled")),
+        _norm_bool(cs.get("suspended_tables_table_enabled")),
+        _norm_bool(cs.get("history_table_enabled")),
+        _norm_bool(cs.get("exception_table_enabled")),
+        _norm_bool(cs.get("recovery_table_enabled")),
+        _norm_bool(cs.get("ddl_history_table_enabled")),
+        _norm_bool(cs.get("batch_apply_use_parallel_bulk")),
+        cs.get("parallel_bulk_max_num_threads"),
+        _norm_bool(cs.get("batch_optimize_by_merge")),
+        _norm_bool(cs.get("use_inserts_for_status_table_updates")),
+        cs.get("task_uuid"),
+    ))
+
+
+async def _upsert_task_settings_change_table(conn, run_id: int, task_id: int, cs: Dict[str, Any]):
+    ddl = _sub(cs, "change_table_settings")
+    await _exec(
+        conn,
+        f"""INSERT INTO {SCHEMA}.rep_task_settings_change_table(task_id, run_id, handle_ddl)
+            VALUES (%s,%s,%s)
+            ON CONFLICT (task_id) DO UPDATE SET run_id=EXCLUDED.run_id, handle_ddl=EXCLUDED.handle_ddl""",
+        (task_id, run_id, _norm_bool(ddl.get("handle_ddl"))),
+    )
+
+
+async def _upsert_task_settings_target(conn, run_id: int, task_id: int, ts: Dict[str, Any]):
+    await _exec(
+        conn,
+        f"""INSERT INTO {SCHEMA}.rep_task_settings_target(
+                task_id, run_id,
+                create_pk_after_data_load, artifacts_cleanup_enabled,
+                handle_truncate_ddl, handle_drop_ddl, max_transaction_size,
+                ddl_handling_policy, ftm_settings)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
+            ON CONFLICT (task_id) DO UPDATE SET
+                run_id=EXCLUDED.run_id,
+                create_pk_after_data_load=EXCLUDED.create_pk_after_data_load,
+                artifacts_cleanup_enabled=EXCLUDED.artifacts_cleanup_enabled,
+                handle_truncate_ddl=EXCLUDED.handle_truncate_ddl,
+                handle_drop_ddl=EXCLUDED.handle_drop_ddl,
+                max_transaction_size=EXCLUDED.max_transaction_size,
+                ddl_handling_policy=EXCLUDED.ddl_handling_policy,
+                ftm_settings=EXCLUDED.ftm_settings
+        """,
+        (
+            task_id, run_id,
+            _norm_bool(ts.get("create_pk_after_data_load")),
+            _norm_bool(ts.get("artifacts_cleanup_enabled")),
+            _norm_bool(ts.get("handle_truncate_ddl")),
+            _norm_bool(ts.get("handle_drop_ddl")),
+            ts.get("max_transaction_size"),
+            json.dumps(ts.get("ddl_handling_policy") or {}, ensure_ascii=False),
+            ts.get("ftm_settings"),
+        ),
+    )
+
+
+async def _upsert_task_sorter_settings(conn, run_id: int, task_id: int, ss: Dict[str, Any]):
+    lts = _sub(ss, "local_transactions_storage")
+    await _exec(
+        conn,
+        f"""INSERT INTO {SCHEMA}.rep_task_sorter_settings(
+                task_id, run_id, memory_keep_time, memory_limit_total, transaction_consistency_timeout)
+            VALUES (%s,%s,%s,%s,%s)
+            ON CONFLICT (task_id) DO UPDATE SET
+                run_id=EXCLUDED.run_id,
+                memory_keep_time=EXCLUDED.memory_keep_time,
+                memory_limit_total=EXCLUDED.memory_limit_total,
+                transaction_consistency_timeout=EXCLUDED.transaction_consistency_timeout
+        """,
+        (
+            task_id, run_id,
+            lts.get("memory_keep_time"),
+            lts.get("memory_limit_total"),
+            ss.get("transaction_consistency_timeout"),
+        ),
+    )
+
+
+async def _upsert_task_settings_kv(conn, run_id: int, task_id: int, tset: Dict[str, Any]):
+    rows = []
+    for full_path, typ, vbool, vnum, vtext, vjson in _flatten("task_settings", tset):
+        rows.append((
+            task_id, run_id, full_path, typ,
+            vbool,
+            vnum,
+            vtext,
+            json.dumps(vjson) if vjson is not None and typ == "json" else None
+        ))
+    if not rows:
+        return
+    sql = f"""INSERT INTO {SCHEMA}.rep_task_settings_kv
+                (task_id, run_id, full_path, val_type, val_bool, val_num, val_text, val_json)
+              VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
+              ON CONFLICT (task_id, full_path) DO UPDATE SET
+                run_id=EXCLUDED.run_id,
+                val_type=EXCLUDED.val_type,
+                val_bool=EXCLUDED.val_bool,
+                val_num=EXCLUDED.val_num,
+                val_text=EXCLUDED.val_text,
+                val_json=EXCLUDED.val_json"""
+    try:
+        await _bulk_insert(conn, sql, rows)
+    except Exception as e:
+        LOG.debug("rep_task_settings_kv upsert skipped (non-fatal): %s", e)
+
+
+async def _insert_task_settings(conn, run_id: int, task_id: int, task_obj: Dict[str, Any]):
+    """
+    Persist task_settings:
+      - sections JSON
+      - normalized tables
+      - KV (full path capture)
+    """
+    tset = task_obj.get("task_settings") or {}
+    # sections
+    await _upsert_task_settings_sections(conn, run_id, task_id, tset)
+    # normalized
+    cs = _sub(tset, "common_settings")
+    await _upsert_task_settings_common(conn, run_id, task_id, cs)
+    await _upsert_task_settings_change_table(conn, run_id, task_id, cs)
+    await _upsert_task_settings_target(conn, run_id, task_id, _sub(tset, "target_settings"))
+    await _upsert_task_sorter_settings(conn, run_id, task_id, _sub(tset, "sorter_settings"))
+    # kv
+    await _upsert_task_settings_kv(conn, run_id, task_id, tset)
+
+
+# ------------------------------
+# NEW: MetricsLog filtering + rollups
+# ------------------------------
+def _make_reader(file_obj=None, data_bytes: Optional[bytes] = None) -> csv.DictReader:
+    """
+    Create a fresh CSV DictReader (tab-delimited) from either a seekable file_obj
+    or from in-memory bytes.
+    """
+    if file_obj is not None:
+        try:
+            file_obj.seek(0)
+        except Exception:
+            pass
+        text_iter = io.TextIOWrapper(file_obj, encoding="utf-8", errors="replace")
+        return csv.DictReader(text_iter, delimiter="\t")
+    else:
+        return csv.DictReader(io.StringIO((data_bytes or b"").decode("utf-8", errors="replace")), delimiter="\t")
+
+
+def _parse_ts_opt(s: Optional[str]) -> Optional[datetime]:
+    if not s:
+        return None
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y/%m/%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S"):
+        try:
+            return datetime.strptime(s.strip(), fmt)
+        except Exception:
+            pass
+    return None
+
+
+def _keep_metrics_row(event_type: Optional[str], status: Optional[str]) -> bool:
+    """
+    Omit rows where eventType=STOP AND status != 'Ok' (case-insensitive).
+    """
+    et = (event_type or "").strip().upper()
+    st = (status or "").strip().lower()
+    if et == "STOP" and st != "ok":
+        return False
+    return True
+
+
+def _n_int(x) -> Optional[int]:
+    try:
+        return int(str(x).strip())
+    except Exception:
+        return None
+
+
+def _bump(acc: Dict[Any, Dict[str, Any]], key: Any,
+          start_ts: Optional[datetime],
+          load_rows: Optional[int], load_bytes: Optional[int],
+          cdc_rows: Optional[int], cdc_bytes: Optional[int]) -> None:
+    """
+    Accumulate totals for a key (task_uuid or (src_fam_id, tgt_fam_id)).
+    """
+    a = acc.get(key)
+    if a is None:
+        a = {"lr": 0, "lb": 0, "cr": 0, "cb": 0, "ev": 0, "first": start_ts, "last": start_ts}
+        acc[key] = a
+    a["lr"] += load_rows or 0
+    a["lb"] += load_bytes or 0
+    a["cr"] += cdc_rows or 0
+    a["cb"] += cdc_bytes or 0
+    a["ev"] += 1
+    if start_ts is not None:
+        if a["first"] is None or start_ts < a["first"]:
+            a["first"] = start_ts
+        if a["last"] is None or start_ts > a["last"]:
+            a["last"] = start_ts
+
+
+async def _create_metrics_run(conn, customer_id: int, server_id: int, file_name: str, collected_at: Optional[datetime]) -> int:
+    row = await (await conn.execute(
+        f"""
+        INSERT INTO {SCHEMA}.rep_metrics_run
+          (customer_id, server_id, file_name, collected_at, created_at)
+        VALUES (%s,%s,%s,%s, NOW())
+        RETURNING metrics_run_id
+        """,
+        (customer_id, server_id, file_name, collected_at)
+    )).fetchone()
+    return int(row["metrics_run_id"])
+
+
+async def _load_alias_map(conn) -> Dict[str, int]:
+    """
+    Load endpoint_alias_map once; key is lower(alias_value).
+    """
+    cur = await conn.execute(
+        f"SELECT LOWER(alias_value) AS a, family_id FROM {SCHEMA}.endpoint_alias_map"
+    )
+    m: Dict[str, int] = {}
+    for r in await cur.fetchall() or []:
+        a = r["a"] if isinstance(r, dict) else r[0]
+        fid = int(r["family_id"] if isinstance(r, dict) else r[1])
+        if a:
+            m[a] = fid
+    return m
+
+
+async def _latest_run_ts(conn, customer_id: int, server_id: int) -> Optional[datetime]:
+    cur = await conn.execute(
+        f"""SELECT MAX(created_at) AS mx
+               FROM {SCHEMA}.ingest_run
+              WHERE customer_id=%s AND server_id=%s""",
+        (customer_id, server_id)
+    )
+    row = await cur.fetchone()
+    return row["mx"] if row and row["mx"] else None
+
+
+async def _task_map_by_uuid(conn, customer_id: int, server_id: int, uuids: List[str]) -> Dict[str, List[int]]:
+    """
+    Map {uuid: [task_id,...]} from the LATEST repo ingest on this (customer, server).
+    """
+    latest = await _latest_run_ts(conn, customer_id, server_id)
+    if not latest or not uuids:
+        return {}
+
+    cur = await conn.execute(
+        f"""
+        SELECT s.task_uuid, t.task_id
+          FROM {SCHEMA}.rep_task_settings_common s
+          JOIN {SCHEMA}.rep_task t     ON t.task_id = s.task_id
+          JOIN {SCHEMA}.ingest_run r   ON r.run_id  = t.run_id
+         WHERE r.customer_id=%s
+           AND r.server_id=%s
+           AND r.created_at = %s
+           AND s.task_uuid = ANY(%s)
+        """,
+        (customer_id, server_id, latest, uuids)
+    )
+    rows = await cur.fetchall() or []
+    m: Dict[str, List[int]] = {}
+    for r in rows:
+        u = r["task_uuid"] if isinstance(r, dict) else r[0]
+        t = int(r["task_id"] if isinstance(r, dict) else r[1])
+        m.setdefault(u, []).append(t)
+    return m
+
+
+# ------------------------------
+# NEW: Replicate Metrics Log ingest (stream + batch + rollups)
+# ------------------------------
+async def ingest_metrics_log(
+    data_bytes: Optional[bytes],
+    customer_name: str,
+    server_name: str,
+    file_name: str,
+    file_obj=None,  # optional streaming input; keeps backward compatibility
+) -> Dict[str, Any]:
+    """
+    Ingest a Replicate MetricsLog TSV exported per Replicate Server.
+
+    Matching:
+      - MetricsLog.taskID → rep_task_settings_common.task_uuid
+      - We match within the *latest* Repository ingest for (customer, server).
+
+    Family mapping:
+      - sourceType / targetType → endpoint_alias_map.alias_value → endpoint_family.family_id
+
+    Performance:
+      - Two-pass scan (pre-scan for earliest ts + UUID set), then batch inserts (BATCH_SIZE).
+      - Each batch is its own transaction to avoid one giant, long-running transaction.
+      - While inserting raw events, we also accumulate per-task and per-pair totals and flush once.
+    """
+    BATCH_SIZE = int(os.getenv("METRICS_BATCH_SIZE", "1000"))
+
+    # ---------- PASS 1: pre-scan for earliest ts, uuids (with early filter) ----------
+    uuids_set: Set[str] = set()
+    earliest_ts: Optional[datetime] = None
+
+    rdr1 = _make_reader(file_obj=file_obj, data_bytes=data_bytes)
+    for r in rdr1:
+        if not _keep_metrics_row(r.get("eventType"), r.get("status")):
+            continue
+        u = (r.get("taskID") or "").strip()
+        if u:
+            uuids_set.add(u)
+        ts = _parse_ts_opt(r.get("startTimestamp"))
+        if ts is not None and (earliest_ts is None or ts < earliest_ts):
+            earliest_ts = ts
+
+    # ---------- DB setup ----------
+    async with connection() as conn:
+        await _set_row_factory(conn)
+
+        # Resolve customer/server
+        customer_id = await _get_or_create_customer(conn, customer_name)
+        server_id   = await _get_or_create_server(conn, customer_id, server_name)
+
+        # Header row (standalone insert)
+        metrics_run_id = await _create_metrics_run(conn, customer_id, server_id, file_name, earliest_ts)
+
+        # Build uuid → task_id[] map once (latest run)
+        uuid_to_tasks = await _task_map_by_uuid(conn, customer_id, server_id, sorted(uuids_set))
+
+        # Load alias family map once
+        alias_map = await _load_alias_map(conn)
+
+        # ---------- PASS 2: batch insert + rollups ----------
+        rows_inserted = 0
+        matched = 0
+        duplicate_conflicts: List[Dict[str, Any]] = []
+
+        # Raw events insert
+        sql_evt = f"""
+            INSERT INTO {SCHEMA}.rep_metrics_event
+              (metrics_run_id, task_uuid, task_id,
+               source_type, target_type, source_family_id, target_family_id,
+               start_ts, stop_ts, event_type, load_rows, load_bytes, cdc_rows, cdc_bytes, status)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+        """
+
+        batch: List[Tuple[Any, ...]] = []
+
+        async def flush_batch():
+            nonlocal batch, rows_inserted
+            if not batch:
+                return
+            await _bulk_insert(conn, sql_evt, batch)
+            rows_inserted += len(batch)
+            batch = []
+
+        # In-memory accumulators
+        task_acc: Dict[str, Dict[str, Any]] = {}
+        pair_acc: Dict[Tuple[int, int], Dict[str, Any]] = {}
+
+        rdr2 = _make_reader(file_obj=file_obj, data_bytes=data_bytes)
+        for r in rdr2:
+            if not _keep_metrics_row(r.get("eventType"), r.get("status")):
+                continue
+
+            task_uuid   = (r.get("taskID") or "").strip()
+            source_type = (r.get("sourceType") or "").strip() or None
+            target_type = (r.get("targetType") or "").strip() or None
+            event_type  = (r.get("eventType") or "").strip() or None
+            status      = (r.get("status") or "").strip() or None
+
+            start_ts = _parse_ts_opt(r.get("startTimestamp"))
+            stop_ts  = _parse_ts_opt(r.get("stopTimestamp"))
+
+            load_rows  = _n_int(r.get("loadRows"))
+            load_bytes = _n_int(r.get("loadBytes"))
+            cdc_rows   = _n_int(r.get("cdcRows"))
+            cdc_bytes  = _n_int(r.get("cdcBytes"))
+
+            task_ids = uuid_to_tasks.get(task_uuid, [])
+            task_id: Optional[int] = None
+            if len(task_ids) == 1:
+                task_id = task_ids[0]
+                matched += 1
+            elif len(task_ids) > 1:
+                duplicate_conflicts.append({"task_uuid": task_uuid, "task_ids": task_ids})
+
+            src_fam_id = alias_map.get((source_type or "").lower()) if source_type else None
+            tgt_fam_id = alias_map.get((target_type or "").lower()) if target_type else None
+
+            # Accumulate rollups
+            if task_uuid:
+                _bump(task_acc, task_uuid, start_ts, load_rows, load_bytes, cdc_rows, cdc_bytes)
+            if src_fam_id is not None and tgt_fam_id is not None:
+                _bump(pair_acc, (src_fam_id, tgt_fam_id), start_ts, load_rows, load_bytes, cdc_rows, cdc_bytes)
+
+            # Buffer raw event
+            batch.append((
+                metrics_run_id, task_uuid, task_id,
+                source_type, target_type, src_fam_id, tgt_fam_id,
+                start_ts, stop_ts, event_type, load_rows, load_bytes, cdc_rows, cdc_bytes, status
+            ))
+
+            if len(batch) >= BATCH_SIZE:
+                await flush_batch()
+
+        # final flush of raw events
+        await flush_batch()
+
+        # ---------- Write rollups (best-effort) ----------
+        # 1) Per-task totals
+        if task_acc:
+            rows_task = []
+            for u, a in task_acc.items():
+                # attach first matched task_id when available, else None
+                tid = None
+                ids = uuid_to_tasks.get(u) or []
+                if ids:
+                    tid = ids[0]
+                rows_task.append((
+                    metrics_run_id, u, tid,
+                    a["lr"], a["lb"], a["cr"], a["cb"], a["ev"], a["first"], a["last"]
+                ))
+            try:
+                await _bulk_insert(conn, f"""
+                    INSERT INTO {SCHEMA}.rep_metrics_task_total
+                      (metrics_run_id, task_uuid, task_id,
+                       load_rows_total, load_bytes_total, cdc_rows_total, cdc_bytes_total,
+                       events_count, first_ts, last_ts)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                    ON CONFLICT (metrics_run_id, task_uuid) DO UPDATE SET
+                       task_id           = COALESCE(EXCLUDED.task_id, {SCHEMA}.rep_metrics_task_total.task_id),
+                       load_rows_total   = EXCLUDED.load_rows_total,
+                       load_bytes_total  = EXCLUDED.load_bytes_total,
+                       cdc_rows_total    = EXCLUDED.cdc_rows_total,
+                       cdc_bytes_total   = EXCLUDED.cdc_bytes_total,
+                       events_count      = EXCLUDED.events_count,
+                       first_ts          = LEAST({SCHEMA}.rep_metrics_task_total.first_ts, EXCLUDED.first_ts),
+                       last_ts           = GREATEST({SCHEMA}.rep_metrics_task_total.last_ts,  EXCLUDED.last_ts)
+                """, rows_task)
+            except Exception as e:
+                LOG.debug("rep_metrics_task_total write skipped (non-fatal): %s", e)
+
+        # 2) Source×Target totals (skip rows with NULL family ids to avoid PK/FK issues)
+        if pair_acc:
+            rows_pair = []
+            for (sfid, tfid), a in pair_acc.items():
+                if sfid is None or tfid is None:
+                    continue
+                rows_pair.append((
+                    metrics_run_id, sfid, tfid,
+                    a["lr"], a["lb"], a["cr"], a["cb"], a["ev"], a["first"], a["last"]
+                ))
+            if rows_pair:
+                try:
+                    await _bulk_insert(conn, f"""
+                        INSERT INTO {SCHEMA}.rep_metrics_pair_total
+                          (metrics_run_id, source_family_id, target_family_id,
+                           load_rows_total, load_bytes_total, cdc_rows_total, cdc_bytes_total,
+                           events_count, first_ts, last_ts)
+                        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                        ON CONFLICT (metrics_run_id, source_family_id, target_family_id) DO UPDATE SET
+                           load_rows_total   = EXCLUDED.load_rows_total,
+                           load_bytes_total  = EXCLUDED.load_bytes_total,
+                           cdc_rows_total    = EXCLUDED.cdc_rows_total,
+                           cdc_bytes_total   = EXCLUDED.cdc_bytes_total,
+                           events_count      = EXCLUDED.events_count,
+                           first_ts          = LEAST({SCHEMA}.rep_metrics_pair_total.first_ts, EXCLUDED.first_ts),
+                           last_ts           = GREATEST({SCHEMA}.rep_metrics_pair_total.last_ts,  EXCLUDED.last_ts)
+                    """, rows_pair)
+                except Exception as e:
+                    LOG.debug("rep_metrics_pair_total write skipped (non-fatal): %s", e)
+
+        LOG.info("[METRICSLOG] metrics_run_id=%s rows=%s matched=%s dup_uuids=%s (task_totals=%s, pair_totals=%s)",
+                 metrics_run_id, rows_inserted, matched, len(duplicate_conflicts),
+                 len(task_acc), len(pair_acc))
+
+        return {
+            "metrics_run_id": metrics_run_id,
+            "file": file_name,
+            "rows": rows_inserted,
+            "inserted": rows_inserted,
+            "matched_by_uuid": matched,
+            "duplicate_uuid_conflicts": duplicate_conflicts,
+        }
+
+
+# ------------------------------
 # Public API
 # ------------------------------
 async def ingest_repository(repo_json: Dict[str, Any], customer_name: str, server_name: str) -> Dict[str, Any]:
@@ -826,6 +1437,7 @@ async def ingest_repository(repo_json: Dict[str, Any], customer_name: str, serve
       - flatten databases to rep_database + per-family detail tables (or JSON fallback)
       - flatten tasks, and link to endpoints by name
       - persist per-task explicit tables to rep_task_table
+      - NEW: persist task_settings (sections + normalized + KV)
     """
     cmd = (
         _get(repo_json, "cmd", "replication_definition")
@@ -857,7 +1469,7 @@ async def ingest_repository(repo_json: Dict[str, Any], customer_name: str, serve
                 role = (db.get("role") or "UNKNOWN").upper()
                 await _load_database_detail(conn, endpoint_id, role, settings)
 
-            # --- Tasks + endpoint links + tables per task
+            # --- Tasks + endpoint links + tables per task + loggers + settings
             endpoints_by_name = await _index_endpoints_by_name(conn, run_id)
             task_ids: List[int] = []
             for obj in tasks:
@@ -869,11 +1481,14 @@ async def ingest_repository(repo_json: Dict[str, Any], customer_name: str, serve
                 target_names = t.get("target_names") or []
                 await _link_task_endpoints(conn, run_id, task_id, endpoints_by_name, source_name, target_names)
 
-                # capture explicit table list for this task (if present)
+                # explicit table list for this task (if present)
                 await _insert_task_tables(conn, run_id, task_id, obj)
 
-                # capture logger levels for this task (if present)
+                # logger levels for this task (if present)
                 await _insert_task_loggers(conn, run_id, task_id, obj)
+
+                # NEW: task settings (sections + normalized + kv)
+                await _insert_task_settings(conn, run_id, task_id, obj)
 
             LOG.info("[INGEST] Completed run_id=%s endpoints=%s tasks=%s", run_id, len(endpoint_ids), len(task_ids))
             return {

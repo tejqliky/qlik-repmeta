@@ -10,15 +10,16 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, JSONResponse
 from pydantic import BaseModel
 
-from psycopg.rows import dict_row
+from psycopg.rows import dict_row  # noqa: F401  (kept for compatibility)
 
 from .ingest_qem import ingest_qem_tsv, ingest_qem_servers_map_tsv
 from .export_report import (
     generate_summary_docx,         # (server-scoped; kept for backward-compat)
     generate_customer_report_docx, # customer-wide report
 )
-from .ingest import ingest_repository  # expects (repo_json, customer_name, server_name)
-from .license_routes import router as license_router  # NEW: license upload routes
+# ✅ Patched: include ingest_metrics_log import
+from .ingest import ingest_repository, ingest_metrics_log  # expects (repo_json, customer_name, server_name)
+from .license_routes import router as license_router  # license upload routes
 
 LOG = logging.getLogger("api")
 
@@ -33,20 +34,67 @@ except Exception:
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("INGEST")
 
-app = FastAPI(title="Qlik RepMeta API", version="2.3")
+API_TITLE = "Qlik RepMeta API"
+API_VERSION = os.getenv("API_VERSION", "2.3")
 
-# Register sub-routers (NEW)
+app = FastAPI(title=API_TITLE, version=API_VERSION)
+
+# Register sub-routers
 app.include_router(license_router)
 
-# ---------------- CORS ----------------
-origins = os.getenv("CORS_ORIGINS", "*").split(",")
+
+# ---------------- CORS (VM-friendly & env-driven) ----------------
+def _parse_csv_env(name: str) -> list[str]:
+    raw = os.getenv(name, "")
+    if not raw:
+        return []
+    return [x.strip() for x in raw.split(",") if x.strip()]
+
+def _parse_bool_env(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "t", "yes", "y", "on"}
+
+# Consolidate origins from either variable (both supported)
+origins_env = _parse_csv_env("CORS_ORIGINS") or _parse_csv_env("ALLOW_ORIGINS")
+
+# Default allow-list aims to cover your local & VM usage out of the box
+default_origins = [
+    "http://172.20.18.221",   # VM access
+    "http://localhost:5173",  # Vite dev
+    "http://127.0.0.1:5173",
+    "http://localhost",
+    "http://127.0.0.1",
+]
+allow_origins = origins_env or default_origins
+
+# Optional regex (e.g., r"^https?://172\.20\.18\.221(:\d+)?$")
+allow_origin_regex = os.getenv("ALLOW_ORIGIN_REGEX", "").strip() or None
+
+# Credentials & headers
+allow_credentials = _parse_bool_env("CORS_ALLOW_CREDENTIALS", True)
+expose_headers = _parse_csv_env("CORS_EXPOSE_HEADERS") or ["Content-Disposition"]
+allow_methods = _parse_csv_env("CORS_ALLOW_METHODS") or ["*"]
+allow_headers = _parse_csv_env("CORS_ALLOW_HEADERS") or ["*"]
+
+# Starlette/browser nuance:
+# If credentials are allowed, do NOT use wildcard "*" origins. Ensure we return a concrete origin.
+if allow_credentials and any(o == "*" for o in allow_origins):
+    # Remove "*" and fall back to defaults if list becomes empty.
+    allow_origins = [o for o in allow_origins if o != "*"] or default_origins
+    # If caller provided ALLOW_ORIGIN_REGEX, it will be used to match and echo request Origin.
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[o.strip() for o in origins],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=allow_origins,
+    allow_origin_regex=allow_origin_regex,
+    allow_credentials=allow_credentials,
+    allow_methods=allow_methods,
+    allow_headers=allow_headers,
+    expose_headers=expose_headers,
 )
+
 
 # ---------------- Models ----------------
 class IngestBody(BaseModel):
@@ -73,6 +121,34 @@ def _infer_server_from_description_text(raw_text: str) -> Optional[str]:
         return None
     matches = re.findall(r'Host\s*name\s*:\s*([A-Za-z0-9._-]+)', raw_text, re.IGNORECASE)
     return matches[-1].strip() if matches else None
+
+
+# ---------------- Diagnostics / Health ----------------
+@app.get("/health")
+async def health():
+    """
+    Lightweight health endpoint for Kubernetes/Docker and manual curl checks.
+    """
+    return {
+        "ok": True,
+        "service": API_TITLE,
+        "version": API_VERSION,
+        "schema": SCHEMA,
+    }
+
+@app.get("/_debug/cors")
+async def debug_cors():
+    """
+    Returns the active CORS configuration to simplify troubleshooting in Docker/VM.
+    """
+    return {
+        "allow_origins": allow_origins,
+        "allow_origin_regex": allow_origin_regex,
+        "allow_credentials": allow_credentials,
+        "allow_methods": allow_methods,
+        "allow_headers": allow_headers,
+        "expose_headers": expose_headers,
+    }
 
 
 # ---------------- Tenancy ----------------
@@ -326,7 +402,7 @@ async def export_customer_docx(customer: str):
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
 
-# Alias to match frontend expectation (NEW)
+# Alias to match frontend expectation
 @app.get("/export/customer")
 async def export_customer(customer: str):
     return await export_customer_docx(customer)
@@ -492,3 +568,25 @@ async def delete_customer_data(customer_id: int, drop_servers: bool = True):
     except Exception as e:
         logging.getLogger("api").exception("Cleanup failed for customer_id=%s", customer_id)
         raise HTTPException(status_code=500, detail=f"Cleanup failed: {e}")
+
+# --- NEW: Replicate Metrics Log (multipart file) ---
+@app.post("/ingest-metrics-log")
+async def ingest_metrics_log_file(
+    file: UploadFile = File(...),
+    customer_name: str = Form(...),
+    server_name: str = Form(...),   # user must pick the Replicate server
+):
+    try:
+        raw = await file.read()
+        res = await ingest_metrics_log(
+            data_bytes=raw,
+            customer_name=customer_name.strip(),
+            server_name=server_name.strip(),
+            file_name=file.filename or "metricsLog.tsv",
+        )
+        return res
+    except HTTPException:
+        raise
+    except Exception as e:
+        log.exception("INGEST /ingest-metrics-log failed")
+        raise HTTPException(status_code=400, detail=str(e))
