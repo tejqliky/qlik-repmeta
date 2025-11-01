@@ -1,42 +1,20 @@
-#root {
-  max-width: 1280px;
-  margin: 0 auto;
-  padding: 2rem;
-  text-align: center;
-}
+/* RepMeta Console — minimal, Tailwind-first CSS
+   We avoid layout overrides and keep just a few global helpers. */
 
-.logo {
-  height: 6em;
-  padding: 1.5em;
-  will-change: filter;
-  transition: filter 300ms;
-}
-.logo:hover {
-  filter: drop-shadow(0 0 2em #646cffaa);
-}
-.logo.react:hover {
-  filter: drop-shadow(0 0 2em #61dafbaa);
-}
+:root { color-scheme: light; }
+html, body, #root { height: 100%; }
 
-@keyframes logo-spin {
-  from {
-    transform: rotate(0deg);
-  }
-  to {
-    transform: rotate(360deg);
-  }
+/* Animations used by progress bars and modals */
+@keyframes progress-move {
+  0% { transform: translateX(-100%); }
+  100% { transform: translateX(100%); }
 }
+.animate-progress-bar { animation: progress-move 1.2s linear infinite; }
 
-@media (prefers-reduced-motion: no-preference) {
-  a:nth-of-type(2) .logo {
-    animation: logo-spin infinite 20s linear;
-  }
+@keyframes modal-in {
+  0% { opacity: 0; transform: scale(.96); }
+  100% { opacity: 1; transform: scale(1); }
 }
+.animate-modal-in { animation: modal-in .14s ease-out; }
 
-.card {
-  padding: 2em;
-}
-
-.read-the-docs {
-  color: #888;
-}
+/* Remove Vite starter styles to prevent unwanted centering/width constraints */

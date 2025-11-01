@@ -1,4 +1,19 @@
 
+def _fmt_duration_t90(mins):
+    """Smart units for median run: <60 => min, <1440 => hours, else days."""
+    try:
+        m = float(mins or 0.0)
+    except Exception:
+        m = 0.0
+    if m < 60:
+        return f"{m:.2f} min"
+    h = m / 60.0
+    if m < 1440:
+        return f"{h:.2f} h"
+    d = h / 24.0
+    return f"{d:.2f} d"
+
+
 import io
 import os
 import re
@@ -24,6 +39,217 @@ from .db import connection
 
 SCHEMA = os.getenv("REPMETA_SCHEMA", "repmeta")
 log = logging.getLogger("export_report")
+
+
+# ============================================================
+# Latest Release Fixes (reads from {SCHEMA}.replicate_release_issue)
+# ============================================================
+from collections import OrderedDict as _OD
+
+def _rowget(row, key, default=None):
+    """Return row[key] for asyncpg.Record, dict, or sequence; graceful fallback."""
+    try:
+        if hasattr(row, "get"):
+            return row.get(key, default)
+        if key in row:
+            return row[key]
+    except Exception:
+        pass
+    return default
+
+
+async def _load_and_group_latest_release_issues(conn):
+    """
+    Returns: (latest_label: str, groups: OrderedDict[str, list[dict]])
+    Groups latest-train rows by endpoint from {SCHEMA}.replicate_release_issue.
+    Uses the passed `conn` if it's open; otherwise opens a short-lived async connection.
+    """
+    import os, re
+
+    sql = f"""
+        SELECT version, issue_date, title, url, jira, endpoints, buckets, text
+        FROM {SCHEMA}.replicate_release_issue
+        ORDER BY COALESCE(issue_date, DATE '1900-01-01') DESC, version DESC, jira NULLS LAST
+    """
+
+    # --- helper to read via your app's wrappers (for the in-scope report connection) ---
+    async def _fetch_via_wrappers(c):
+        try:
+            return await _try_all(c, sql, ())
+        except Exception:
+            pass
+        try:
+            return await _all(c, sql, ())
+        except Exception:
+            pass
+        return None
+
+    rows = None
+
+    # 1) Try the incoming connection if it looks open/usable
+    try:
+        is_closed_flag = getattr(conn, "closed", None)
+        is_open = (conn is not None) and (is_closed_flag is False or is_closed_flag == 0)
+    except Exception:
+        is_open = False
+
+    if is_open:
+        rows = await _fetch_via_wrappers(conn)
+
+    # 2) If wrappers didn’t work or conn is closed, open our own async connection and fetch directly
+    if rows is None:
+        import psycopg
+        from psycopg.rows import dict_row
+
+        dsn = os.getenv("DATABASE_URL") or os.getenv("REPMETA_PG_DSN")
+        if not dsn:
+            log.error("Latest-fixes: no DATABASE_URL/REPMETA_PG_DSN set")
+            return "Latest", _OD()
+
+        # IMPORTANT: await the coroutine to get the connection, then use it
+        ac = await psycopg.AsyncConnection.connect(dsn)
+        try:
+            async with ac.cursor(row_factory=dict_row) as cur:
+                await cur.execute(sql)
+                rows = await cur.fetchall()
+        finally:
+            try:
+                await ac.close()
+            except Exception:
+                pass
+
+    if not rows:
+        return "Latest", _OD()
+
+    # ---- row accessor that works with dict / asyncpg.Record-like / tuple-ish ----
+    def _rowget(row, key, default=None):
+        try:
+            if hasattr(row, "get"):
+                return row.get(key, default)
+            if key in row:
+                return row[key]
+        except Exception:
+            pass
+        return default
+
+    # Prefer latest month by issue_date; fallback to version parsing
+    def month_key(r):
+        d = _rowget(r, "issue_date")
+        return (d.year, d.month) if d else (0, 0)
+
+    dated = [r for r in rows if _rowget(r, "issue_date") is not None]
+    latest_label = "Latest"
+
+    if dated:
+        y, m = max((month_key(r) for r in dated))
+        month_names = [None,"January","February","March","April","May","June","July","August","September","October","November","December"]
+        latest_label = f"{month_names[m]} {y}"
+        def latest_filter(r):
+            d = _rowget(r, "issue_date")
+            return d and d.year == y and d.month == m
+    else:
+        month_map = {
+            "january":1,"february":2,"march":3,"april":4,"may":5,"june":6,
+            "july":7,"august":8,"september":9,"october":10,"november":11,"december":12
+        }
+        def parse_vm(v):
+            if not v: return (0,0)
+            vlow = v.lower()
+            y = 0
+            m = 0
+            m_year = re.search(r"(20\d{2})", vlow)
+            if m_year: y = int(m_year.group(1))
+            for nm, code in month_map.items():
+                if nm in vlow:
+                    m = code
+                    break
+            return (y, m)
+        y, m = (0,0)
+        for r in rows:
+            vy, vm = parse_vm(_rowget(r, "version"))
+            if (vy, vm) > (y, m): y, m = vy, vm
+        month_names = [None,"January","February","March","April","May","June","July","August","September","October","November","December"]
+        latest_label = f"{month_names[m]} {y}" if (y and m) else "Latest"
+        def latest_filter(r):
+            vy, vm = parse_vm(_rowget(r, "version"))
+            return (vy, vm) == (y, m) if (y and m) else True
+
+    latest_rows = [r for r in rows if latest_filter(r)]
+    if not latest_rows:
+        return latest_label, _OD()
+
+    # Group by endpoints (default "General")
+    def endpoints_of(r):
+        eps = _rowget(r, "endpoints") or ["General"]
+        try:
+            return list(eps) if eps else ["General"]
+        except Exception:
+            return ["General"]
+
+    all_eps = set()
+    for r in latest_rows:
+        for ep in endpoints_of(r):
+            all_eps.add(ep or "General")
+
+    def ep_key(name: str):
+        return (name == "General", (name or "").lower())
+
+    groups = _OD()
+    for ep in sorted(all_eps, key=ep_key):
+        bucket = []
+        for r in latest_rows:
+            if ep in endpoints_of(r):
+                bucket.append({
+                    "jira": _rowget(r, "jira") or "-",
+                    "title": _rowget(r, "title") or (_rowget(r, "text") or "-"),
+                    "buckets": _rowget(r, "buckets") or [],
+                    "url": _rowget(r, "url") or "-",
+                })
+        if bucket:
+            groups[ep] = bucket
+
+    return latest_label, groups
+
+
+def _render_latest_release_fixes_section(doc, latest_label: str, groups):
+    """Render the 'Latest Release Fixes' section using groups from DB (no URL column)."""
+    _add_heading(doc, "Latest Release Fixes", 1)
+    _add_text(
+        doc,
+        "Because at least one of your servers may not be on the latest GA release, "
+        "here is the full set of fixes in the latest release across all endpoints.",
+        size=9, italic=True,
+    )
+    if not groups:
+        _add_text(doc, "Release issues are not available in the database.", size=10, italic=True)
+        return
+
+    doc.add_paragraph()
+    _add_text(doc, f"All Fixes in Latest Release ({latest_label})", size=11, bold=True)
+
+    for ep, items in groups.items():
+        doc.add_paragraph()
+        _add_text(doc, ep, size=10, bold=True)
+
+        # No URL column anymore
+        headers = ["JIRA", "Summary", "Buckets"]
+        rows = []
+        for r in items:
+            # items are dicts from the loader
+            jira = (r.get("jira") or "-")
+            title = r.get("title") or (r.get("text") or "-")
+            if title and len(title) > 200:
+                title = title[:197] + "..."
+            buckets = r.get("buckets") or []
+            if isinstance(buckets, (list, tuple)):
+                buckets = ", ".join(buckets)
+            elif not buckets:
+                buckets = "-"
+            rows.append((jira, title, buckets))
+
+        _add_table(doc, headers=headers, rows=rows, style="Light Shading Accent 1")
+
+
 
 # ============================================================
 # Built-in master lists (fallback if DB tables are absent/empty)
@@ -337,6 +563,148 @@ def _set_cell_shading(cell, fill_hex: str = "EDF2FF"):
     shd.set(qn("w:fill"), fill_hex)
     tc_pr.append(shd)
 
+
+def _add_note_panel(doc, title=None, hint=None):
+    """
+    Render a simple two-row table (header + body) for customer-facing notes.
+    Kept intentionally simple so it's fully editable in Word.
+    """
+    if not title:
+        title = "📝 Notes & Observations"
+    if not hint:
+        hint = "Capture key takeaways, risks, decisions, and next steps…"
+
+    t = doc.add_table(rows=2, cols=1)
+    try:
+        t.style = "Light Shading Accent 2"
+    except Exception:
+        pass
+
+    hdr = t.rows[0].cells[0]
+    _set_cell_shading(hdr, "E8F5E9")  # pale green
+    p = hdr.paragraphs[0] if hdr.paragraphs else hdr.add_paragraph()
+    r = p.add_run(title)
+    try:
+        r.bold = True
+    except Exception:
+        pass
+
+    body = t.rows[1].cells[0]
+    p2 = body.paragraphs[0] if body.paragraphs else body.add_paragraph()
+    r2 = p2.add_run(hint)
+    try:
+        r2.italic = True
+    except Exception:
+        pass
+
+    for _ in range(6):
+        body.add_paragraph()
+
+    doc.add_paragraph()
+
+# ============================
+# Optional Qlik branding (header only)
+# ============================
+DEFAULT_BRAND_LOGO_URL = os.getenv(
+    "REPMETA_BRAND_FIRSTPAGE_LOGO_URL",
+    "https://github.com/tejqliky/qlik-repmeta/blob/main/Qlik_logo.png",
+)
+DEFAULT_BRAND_BANNER_URL = os.getenv(
+    "REPMETA_BRAND_BANNER_URL",
+    "https://github.com/tejqliky/qlik-repmeta/blob/main/Qlik_Banner.png",
+)
+
+def _to_raw_github(url: str) -> str:
+    try:
+        import re as _re
+        m = _re.match(r"https?://github\.com/([^/]+)/([^/]+)/blob/([^/]+)/(.*)", url or "", flags=_re.I)
+        if m:
+            user, repo, branch, rest = m.groups()
+            return f"https://raw.githubusercontent.com/{user}/{repo}/{branch}/{rest}"
+    except Exception:
+        pass
+    return url
+
+def _try_fetch_bytes(url: str):
+    try:
+        import urllib.request
+        req = urllib.request.Request(url, headers={"User-Agent": "repmeta-report/1.0"})
+        with urllib.request.urlopen(req, timeout=20) as r:
+            return r.read()
+    except Exception:
+        return None
+
+def _read_brand_asset(url: str, path_env: str):
+    # URL takes precedence; path is fallback
+    u = _to_raw_github(url) if url else None
+    if u:
+        data = _try_fetch_bytes(u)
+        if data:
+            return data
+    p = os.getenv(path_env)
+    if p and os.path.exists(p):
+        try:
+            with open(p, "rb") as f:
+                return f.read()
+        except Exception:
+            return None
+    return None
+
+def _apply_branding(doc: Document):
+    """
+    Adds Qlik logo on the FIRST page header and a green banner in the header of ALL pages.
+    Skips silently if assets are unavailable. Does NOT alter body styles/colors/logic.
+    """
+    from docx.shared import Inches
+    import io as _io
+
+    if not getattr(doc, "sections", None):
+        return
+
+    logo_bytes = _read_brand_asset(DEFAULT_BRAND_LOGO_URL, "REPMETA_BRAND_FIRSTPAGE_LOGO_PATH")
+    banner_bytes = _read_brand_asset(DEFAULT_BRAND_BANNER_URL, "REPMETA_BRAND_BANNER_PATH")
+
+    if not logo_bytes and not banner_bytes:
+        return
+
+    sec = doc.sections[0]
+    try:
+        sec.different_first_page_header_footer = True
+    except Exception:
+        pass
+
+    def _place_image_in_header(header_obj, data: bytes, width_in: float, align_left: bool = True):
+        if not data:
+            return
+        p = header_obj.paragraphs[0] if header_obj.paragraphs else header_obj.add_paragraph()
+        r = p.add_run()
+        try:
+            r.add_picture(_io.BytesIO(data), width=Inches(width_in))
+            try:
+                p.alignment = WD_ALIGN_PARAGRAPH.LEFT if align_left else WD_ALIGN_PARAGRAPH.CENTER
+            except Exception:
+                pass
+        except Exception:
+            # If picture decoding fails, skip silently
+            return
+
+    # Choose reasonable widths
+    banner_width = 6.5
+
+    # First page header
+    h_first = getattr(sec, "first_page_header", None) or sec.header
+    if h_first:
+        if logo_bytes:
+            _place_image_in_header(h_first, logo_bytes, width_in=1.8, align_left=True)
+        if banner_bytes:
+            _place_image_in_header(h_first, banner_bytes, width_in=banner_width, align_left=True)
+
+    # Default header for pages 2+
+    h_std = sec.header
+    if h_std and banner_bytes:
+        _place_image_in_header(h_std, banner_bytes, width_in=banner_width, align_left=True)
+
+
 def _cell_bold(cell, size: int = 12):
     for p in cell.paragraphs:
         for r in p.runs:
@@ -397,86 +765,99 @@ def _fmt_bytes(n: float) -> str:
 
 async def _metrics_monthly_current_year(conn, customer_id: int):
     """
-    NOW: Return monthly LOAD/CDC totals for the LAST 6 MONTHS,
-    anchored to the latest month present in the latest metrics-log
-    run per (customer, server).
-
-    Rules:
-    - Use only the latest rep_metrics_run per server for the customer.
-    - Consider only STOP/OK events.
-    - Find the max month across those events; include that month + previous 5 months.
-    - Sum by month; return humanized bytes.
+    Monthly Volume (Last 6 Months)
+    Load = latest per (month, task) from v_metrics_events_clean
+    CDC  = sum(cdc_bytes) within the month from v_metrics_events_clean
     """
     sql = f"""
-        WITH latest_runs AS (
-          SELECT DISTINCT ON (server_id)
-                 metrics_run_id, server_id
-          FROM {SCHEMA}.rep_metrics_run
+        WITH base AS (
+          SELECT
+            date_trunc('month', ts)::date AS m,
+            customer_id, server_id, task_id, task_uuid,
+            ts, load_bytes, cdc_bytes
+          FROM {SCHEMA}.v_metrics_events_clean
           WHERE customer_id = %s
-          ORDER BY server_id, created_at DESC NULLS LAST, metrics_run_id DESC
-        ),
-        events AS (
-          SELECT COALESCE(e.stop_ts, e.start_ts) AS ts,
-                 COALESCE(e.load_bytes,0)::bigint AS load_b,
-                 COALESCE(e.cdc_bytes,0)::bigint  AS cdc_b
-          FROM {SCHEMA}.rep_metrics_event e
-          JOIN latest_runs lr ON lr.metrics_run_id = e.metrics_run_id
-          WHERE UPPER(COALESCE(e.event_type,'')) = 'STOP'
-            AND UPPER(COALESCE(e.status,'OK'))   = 'OK'
         ),
         bounds AS (
           SELECT date_trunc('month', MAX(ts)) AS max_month
-          FROM events
+          FROM {SCHEMA}.v_metrics_events_clean
+          WHERE customer_id = %s
         ),
-        filtered AS (
-          SELECT date_trunc('month', e.ts)::date AS m, e.load_b, e.cdc_b
-          FROM events e
-          JOIN bounds b ON TRUE
-          WHERE e.ts >= (b.max_month - INTERVAL '5 months')
-            AND e.ts  < (b.max_month + INTERVAL '1 month')
+        within6 AS (
+          SELECT b.*
+          FROM base b, bounds
+          WHERE b.ts >= (bounds.max_month - INTERVAL '5 months')
+            AND b.ts  < (bounds.max_month + INTERVAL '1 month')
+        ),
+        latest_per_task_month AS (
+          SELECT m, COALESCE(task_id::text, task_uuid) AS tkey, load_bytes, ts,
+                 ROW_NUMBER() OVER (PARTITION BY m, COALESCE(task_id::text, task_uuid) ORDER BY ts DESC) AS rn
+          FROM within6
+        ),
+        load_month AS (
+          SELECT m, SUM(load_bytes)::bigint AS load_b
+          FROM latest_per_task_month
+          WHERE rn = 1
+          GROUP BY m
+        ),
+        cdc_month AS (
+          SELECT m, SUM(cdc_bytes)::bigint AS cdc_b
+          FROM within6
+          GROUP BY m
         )
-        SELECT m,
-               SUM(load_b)::bigint AS load_b,
-               SUM(cdc_b)::bigint  AS cdc_b
-        FROM filtered
-        GROUP BY m
+        SELECT COALESCE(l.m, c.m) AS m,
+               COALESCE(l.load_b,0)::bigint AS load_b,
+               COALESCE(c.cdc_b,0)::bigint  AS cdc_b
+        FROM load_month l
+        FULL OUTER JOIN cdc_month c USING (m)
         ORDER BY m;
     """
-    rows = await _try_all(conn, sql, (customer_id,)) or []
-
-    # If no events exist at all (no latest runs or no STOP/OK rows), return empty.
-    if not rows:
-        return []
-
+    rows = await _try_all(conn, sql, (customer_id, customer_id)) or []
     out = []
     for r in rows:
-        m  = r["m"]  # date
+        m  = r["m"]
         lb = int(r.get("load_b") or 0)
         cb = int(r.get("cdc_b") or 0)
         out.append((str(m), _fmt_bytes(lb), _fmt_bytes(cb), _fmt_bytes(lb + cb)))
     return out
-
-
-
 async def _metrics_yearly_last5(conn, customer_id: int):
+    """
+    Annual Volume (Last 5 Years)
+    Load = latest per (year, task) from v_metrics_events_clean
+    CDC  = sum(cdc_bytes) within the year from v_metrics_events_clean
+    """
     sql = f"""
-        WITH latest_runs AS (
-          SELECT DISTINCT ON (server_id)
-                 metrics_run_id, server_id
-          FROM {SCHEMA}.rep_metrics_run
+        WITH base AS (
+          SELECT
+            date_part('year', ts)::int AS y,
+            customer_id, server_id, task_id, task_uuid,
+            ts, load_bytes, cdc_bytes
+          FROM {SCHEMA}.v_metrics_events_clean
           WHERE customer_id = %s
-          ORDER BY server_id, created_at DESC NULLS LAST, metrics_run_id DESC
+            AND date_part('year', ts) >= date_part('year', CURRENT_DATE) - 4
+        ),
+        latest_per_task_year AS (
+          SELECT y, COALESCE(task_id::text, task_uuid) AS tkey, load_bytes, ts,
+                 ROW_NUMBER() OVER (PARTITION BY y, COALESCE(task_id::text, task_uuid) ORDER BY ts DESC) AS rn
+          FROM base
+        ),
+        load_year AS (
+          SELECT y, SUM(load_bytes)::bigint AS load_b
+          FROM latest_per_task_year
+          WHERE rn = 1
+          GROUP BY y
+        ),
+        cdc_year AS (
+          SELECT y, SUM(cdc_bytes)::bigint AS cdc_b
+          FROM base
+          GROUP BY y
         )
-        SELECT date_part('year', COALESCE(e.stop_ts, e.start_ts))::int AS y,
-               COALESCE(SUM(e.load_bytes),0)::bigint AS load_b,
-               COALESCE(SUM(e.cdc_bytes),0)::bigint  AS cdc_b
-        FROM {SCHEMA}.rep_metrics_event e
-        JOIN latest_runs lr ON lr.metrics_run_id = e.metrics_run_id
-        WHERE UPPER(COALESCE(e.event_type,'')) = 'STOP'
-          AND UPPER(COALESCE(e.status,'OK'))   = 'OK'
-          AND date_part('year', COALESCE(e.stop_ts, e.start_ts)) >= date_part('year', CURRENT_DATE) - 4
-        GROUP BY 1
-        ORDER BY 1;
+        SELECT COALESCE(l.y, c.y) AS y,
+               COALESCE(l.load_b,0)::bigint AS load_b,
+               COALESCE(c.cdc_b,0)::bigint  AS cdc_b
+        FROM load_year l
+        FULL OUTER JOIN cdc_year c USING (y)
+        ORDER BY y;
     """
     rows = await _try_all(conn, sql, (customer_id,)) or []
     out = []
@@ -486,96 +867,122 @@ async def _metrics_yearly_last5(conn, customer_id: int):
         cb = int(r.get("cdc_b") or 0)
         out.append((str(y), _fmt_bytes(lb), _fmt_bytes(cb), _fmt_bytes(lb + cb)))
     return out
-
-
 async def _metrics_top_tasks(conn, customer_id: int, limit: int = 5):
+    """
+    Top 5 Tasks by Volume (Load + CDC)
+    Load = load_bytes from v_metrics_task_latest_event (latest per task)
+    CDC  = sum(cdc_bytes) from v_metrics_events_clean
+    """
     sql = f"""
-        WITH latest_runs AS (
-          SELECT DISTINCT ON (server_id)
-                 metrics_run_id, server_id
-          FROM {SCHEMA}.rep_metrics_run
+        WITH load_latest AS (
+          SELECT customer_id, server_id, task_id, task_uuid, load_bytes
+          FROM {SCHEMA}.v_metrics_task_latest_event
           WHERE customer_id = %s
-          ORDER BY server_id, created_at DESC NULLS LAST, metrics_run_id DESC
         ),
-        agg AS (
-          SELECT lr.server_id, e.task_id, e.task_uuid,
-                 COALESCE(SUM(e.load_bytes),0)::bigint AS load_b,
-                 COALESCE(SUM(e.cdc_bytes),0)::bigint  AS cdc_b
-          FROM {SCHEMA}.rep_metrics_event e
-          JOIN latest_runs lr ON lr.metrics_run_id = e.metrics_run_id
-          WHERE UPPER(COALESCE(e.event_type,'')) = 'STOP'
-            AND UPPER(COALESCE(e.status,'OK'))   = 'OK'
-          GROUP BY 1,2,3
+        cdc_sum AS (
+          SELECT customer_id, server_id, task_id, task_uuid, SUM(cdc_bytes)::bigint AS cdc_b
+          FROM {SCHEMA}.v_metrics_events_clean
+          WHERE customer_id = %s
+          GROUP BY 1,2,3,4
+        ),
+        joined AS (
+          SELECT
+            COALESCE(l.customer_id, c.customer_id) AS customer_id,
+            COALESCE(l.server_id,  c.server_id)  AS server_id,
+            COALESCE(l.task_id,    c.task_id)    AS task_id,
+            COALESCE(l.task_uuid,  c.task_uuid)  AS task_uuid,
+            COALESCE(l.load_bytes, 0)::bigint    AS load_b,
+            COALESCE(c.cdc_b,      0)::bigint    AS cdc_b
+          FROM load_latest l
+          FULL OUTER JOIN cdc_sum c
+          ON l.customer_id = c.customer_id
+         AND l.server_id  = c.server_id
+         AND COALESCE(l.task_id::text, l.task_uuid) = COALESCE(c.task_id::text, c.task_uuid)
         ),
         name_resolved AS (
-          SELECT a.server_id, a.task_id, a.task_uuid, a.load_b, a.cdc_b,
-                 COALESCE(t.task_name, NULL) AS task_name
-          FROM agg a
-          LEFT JOIN LATERAL (
-            SELECT rt.task_name
-            FROM {SCHEMA}.rep_task rt
-            JOIN {SCHEMA}.ingest_run ir2 ON ir2.run_id = rt.run_id
-            WHERE ir2.customer_id = %s
-              AND ((a.task_id  IS NOT NULL AND rt.task_id  = a.task_id)
-                OR (a.task_uuid IS NOT NULL AND rt.task_uuid = a.task_uuid))
-            ORDER BY rt.run_id DESC
-            LIMIT 1
-          ) t ON TRUE
+          SELECT j.*, ds.server_name,
+                 (
+                   SELECT rt.task_name
+                   FROM {SCHEMA}.rep_task rt
+                   JOIN {SCHEMA}.ingest_run ir2 ON ir2.run_id = rt.run_id
+                   WHERE ir2.customer_id = j.customer_id
+                     AND ( (j.task_id  IS NOT NULL AND rt.task_id  = j.task_id)
+                        OR (j.task_uuid IS NOT NULL AND rt.task_uuid = j.task_uuid) )
+                   ORDER BY rt.run_id DESC
+                   LIMIT 1
+                 ) AS task_name
+          FROM joined j
+          JOIN {SCHEMA}.dim_server ds ON ds.server_id = j.server_id
         )
-        SELECT ds.server_name,
-               COALESCE(n.task_name, NULL) AS task_name,
-               n.task_uuid, n.load_b, n.cdc_b,
-               (n.load_b + n.cdc_b) AS total_b
-        FROM name_resolved n
-        JOIN {SCHEMA}.dim_server ds ON ds.server_id = n.server_id
+        SELECT
+          COALESCE(task_name, '(unknown) ' || LEFT(COALESCE(task_uuid::text,''),8)) AS task_label,
+          server_name,
+          load_b, cdc_b, (load_b + cdc_b) AS total_b
+        FROM name_resolved
         ORDER BY total_b DESC NULLS LAST
         LIMIT {limit};
     """
     rows = await _try_all(conn, sql, (customer_id, customer_id)) or []
     out = []
     for r in rows:
-        name = r.get("task_name") or f"(unknown) {(r.get('task_uuid') or '')[:8]}"
-        srv  = r.get("server_name") or ""
-        lb   = int(r.get("load_b") or 0)
-        cb   = int(r.get("cdc_b") or 0)
-        out.append((name, srv, _fmt_bytes(lb), _fmt_bytes(cb), _fmt_bytes(lb + cb)))
+        out.append((
+            r["task_label"],
+            r["server_name"] or "",
+            _fmt_bytes(int(r["load_b"] or 0)),
+            _fmt_bytes(int(r["cdc_b"]  or 0)),
+            _fmt_bytes(int(r["total_b"] or 0)),
+        ))
     return out
-
-
 async def _metrics_top_endpoints(conn, customer_id: int, role: str, metric: str, limit: int = 5):
     """
     Top endpoints using only the latest metrics-log run per server.
     role   : "SOURCE" | "TARGET"
     metric : "load" | "cdc"
+    For 'load', use v_metrics_task_latest_event (latest per task).
+    For 'cdc', sum from v_metrics_events_clean.
     """
     assert role in ("SOURCE", "TARGET")
     assert metric in ("load", "cdc")
 
-    byte_col   = "load_bytes" if metric == "load" else "cdc_bytes"
     fam_id_col = "source_family_id" if role == "SOURCE" else "target_family_id"
     type_col   = "source_type"      if role == "SOURCE" else "target_type"
 
+    if metric == "load":
+        sql = f"""
+            WITH latest AS (
+              SELECT customer_id, server_id, {fam_id_col} AS fam_id, {type_col} AS type_label, load_bytes
+              FROM {SCHEMA}.v_metrics_task_latest_event
+              WHERE customer_id = %s
+            )
+            SELECT COALESCE(f.family_name, l.type_label) AS endpoint_label,
+                   SUM(l.load_bytes)::bigint AS vol_bytes
+            FROM latest l
+            LEFT JOIN {SCHEMA}.endpoint_family f ON f.family_id = l.fam_id
+            GROUP BY 1
+            ORDER BY vol_bytes DESC NULLS LAST
+            LIMIT {limit};
+        """
+        rows = await _try_all(conn, sql, (customer_id,)) or []
+        out = []
+        for r in rows:
+            lbl = r.get("endpoint_label")
+            if not lbl:
+                continue
+            lbl = canonize_to_master(lbl, is_source=(role == "SOURCE"))
+            out.append((lbl, _fmt_bytes(int(r.get("vol_bytes") or 0))))
+        return out
+
+    # metric == "cdc"
     sql = f"""
-        WITH latest_runs AS (
-          SELECT DISTINCT ON (server_id)
-                 metrics_run_id, server_id
-          FROM {SCHEMA}.rep_metrics_run
-          WHERE customer_id = %s
-          ORDER BY server_id, created_at DESC NULLS LAST, metrics_run_id DESC
-        )
-        SELECT
-            COALESCE(f.family_name, e.{type_col}) AS endpoint_label,
-            COALESCE(SUM(e.{byte_col}), 0)::bigint AS vol_bytes
-        FROM {SCHEMA}.rep_metrics_event e
-        JOIN latest_runs lr ON lr.metrics_run_id = e.metrics_run_id
+        SELECT COALESCE(f.family_name, e.{type_col}) AS endpoint_label,
+               SUM(e.cdc_bytes)::bigint AS vol_bytes
+        FROM {SCHEMA}.v_metrics_events_clean e
         LEFT JOIN {SCHEMA}.endpoint_family f ON f.family_id = e.{fam_id_col}
-        WHERE UPPER(COALESCE(e.event_type,'')) = 'STOP'
-          AND UPPER(COALESCE(e.status,'OK'))   = 'OK'
+        WHERE e.customer_id = %s
         GROUP BY 1
         ORDER BY vol_bytes DESC NULLS LAST
         LIMIT {limit};
     """
-
     rows = await _try_all(conn, sql, (customer_id,)) or []
     out = []
     for r in rows:
@@ -585,9 +992,6 @@ async def _metrics_top_endpoints(conn, customer_id: int, role: str, metric: str,
         lbl = canonize_to_master(lbl, is_source=(role == "SOURCE"))
         out.append((lbl, _fmt_bytes(int(r.get("vol_bytes") or 0))))
     return out
-
-
-
 def _add_metrics_section(doc, title, rows, headers):
     _add_text(doc, title, size=12, bold=True)
     if not rows:
@@ -608,7 +1012,7 @@ def _pretty_type(raw: Any) -> str:
         "Oracle": "Oracle (on-prem / Oracle Cloud)",
         "Snowflake": "Snowflake",
         "Bigquery": "Google BigQuery",
-        "Kafka": "",
+        "Kafka": "Kafka",
         "Filechannel": "File Channel endpoint",
         "Mysql": "MySQL",
         "Db2": "IBM DB2 for LUW",
@@ -632,7 +1036,7 @@ def _type_icon(pretty: str) -> str:
         "Oracle (on-prem / Oracle Cloud)": "🟥",
         "Snowflake": "❄️",
         "Google BigQuery": "🔷",
-        "Kafka": "",
+        "Kafka": "🔷",
         "File Channel endpoint": "📁",
         "MySQL": "🐬",
         "IBM DB2 for LUW": "🟣",
@@ -1083,6 +1487,10 @@ async def generate_summary_docx(customer_name: str, server_name: str) -> Tuple[b
         tgt_n = role_map.get("TARGET", 0)
 
     doc = Document()
+    try:
+        _apply_branding(doc)
+    except Exception:
+        pass
     _add_title(doc, "Qlik Replicate - Server Review")
     _add_text(doc, f"Customer: {customer_name}", size=10)
     _add_text(doc, f"Server: {server_name}", size=10)
@@ -1092,6 +1500,8 @@ async def generate_summary_docx(customer_name: str, server_name: str) -> Tuple[b
     doc.add_page_break()
 
     _add_heading(doc, "Executive Summary", 1)
+    _add_note_panel(doc, "📝 Notes & Observations — Server Review")
+
     _kpi_cards(
         doc,
         cards=[
@@ -1111,10 +1521,160 @@ async def generate_summary_docx(customer_name: str, server_name: str) -> Tuple[b
 # ============================================================
 # Customer Technical Overview
 # ============================================================
+
+
+async def _endpoint_mix_from_repo(conn, customer_id: int):
+    """Compute Endpoint Mix from latest Repository JSON ingest per server.
+    Logic:
+      - Find latest ingest_run per server for this customer.
+      - Read endpoints from rep_database for those runs.
+      - Load endpoint-level settings_json by first checking rep_db_settings_json (if present),
+        then auto-discovering any table named rep_db_% that has a settings_json column and
+        querying by endpoint_id.
+      - For SOURCE endpoints whose settings_json contains a key 'logstreamstagingtask'
+        (case-insensitive), recategorize as 'Log Stream' and do not double-count under the
+        original family (e.g., Microsoft SQL Server).
+      - Canonicalize family labels via canonize_to_master(..., is_source=role=='SOURCE').
+    Returns:
+      (src_rows, tgt_rows) where each is a list of {'type': str, 'uses': int} sorted desc by uses.
+    """
+    # 1) Latest run per server for this customer
+    endpoints = await _all(conn, f"""
+        WITH latest AS (
+          SELECT server_id, MAX(created_at) AS last_ingest
+          FROM {SCHEMA}.ingest_run
+          WHERE customer_id=%s
+          GROUP BY server_id
+        ),
+        runs AS (
+          SELECT r.server_id, r.run_id
+          FROM latest l
+          JOIN {SCHEMA}.ingest_run r
+            ON r.server_id=l.server_id AND r.created_at=l.last_ingest AND r.customer_id=%s
+        )
+        SELECT d.endpoint_id, d.role, COALESCE(d.db_settings_type,'(unknown)') AS type
+        FROM {SCHEMA}.rep_database d
+        JOIN runs u ON d.run_id=u.run_id
+    """, (customer_id, customer_id)) or []
+
+    if not endpoints:
+        return [], []
+
+    # 2) Collect endpoint_ids and attempt to load settings_json
+    eids = [int(r["endpoint_id"] if isinstance(r, dict) else r[0]) for r in endpoints]
+    settings_map = {}
+
+    # 2a) Try generic staging table first (if present)
+    try:
+        rows = await _all(conn, f"SELECT endpoint_id, settings_json FROM {SCHEMA}.rep_db_settings_json WHERE endpoint_id = ANY(%s)", (eids,))
+        for r in rows or []:
+            eid = int(r["endpoint_id"] if isinstance(r, dict) else r[0])
+            settings_map[eid] = r["settings_json"] if isinstance(r, dict) else r[1]
+    except Exception:
+        pass
+
+    # 2b) If still missing some, dynamically scan all rep_db_% tables with a settings_json column
+    if len(settings_map) < len(eids):
+        try:
+            tables = await _all(conn, """
+                SELECT table_schema, table_name
+                FROM information_schema.columns
+                WHERE table_schema=%s AND column_name='settings_json' AND table_name LIKE 'rep_db_%'
+            """, (SCHEMA,)) or []
+            tbls = [f"{t['table_schema']}.{t['table_name']}" for t in tables]
+            for fq in tbls:
+                missing = [eid for eid in eids if eid not in settings_map]
+                if not missing:
+                    break
+                try:
+                    q = f"SELECT endpoint_id, settings_json FROM {fq} WHERE endpoint_id = ANY(%s)"
+                    rows = await _all(conn, q, (missing,))
+                    for r in rows or []:
+                        eid = int(r["endpoint_id"] if isinstance(r, dict) else r[0])
+                        if eid not in settings_map:
+                            settings_map[eid] = r["settings_json"] if isinstance(r, dict) else r[1]
+                except Exception:
+                    continue
+        except Exception:
+            pass
+
+    def _is_logstream(settings_json) -> bool:
+        if settings_json is None:
+            return False
+        try:
+            obj = settings_json if isinstance(settings_json, dict) else json.loads(settings_json)
+            if not isinstance(obj, dict):
+                return False
+            for k, v in obj.items():
+                if isinstance(k, str) and k.lower() == "logstreamstagingtask":
+                    # present and non-empty → treat as log stream
+                    if isinstance(v, str):
+                        return bool(v.strip())
+                    return True
+        except Exception:
+            return False
+        return False
+
+    # 3) Accumulate counts with logstream carve-out for sources
+    src_acc, tgt_acc = {}, {}
+    for r in endpoints:
+        eid  = int(r["endpoint_id"] if isinstance(r, dict) else r[0])
+        role = str(r["role"] if isinstance(r, dict) else r[1]).upper().strip()
+        raw  = (str(r["type"] if isinstance(r, dict) else r[2]).strip()) or "(unknown)"
+        if role == "SOURCE" and _is_logstream(settings_map.get(eid)):
+            label = "Log Stream"
+        else:
+            label = canonize_to_master(raw, is_source=(role == "SOURCE"))
+
+        if role == "SOURCE":
+            src_acc[label] = src_acc.get(label, 0) + 1
+        elif role == "TARGET":
+            tgt_acc[label] = tgt_acc.get(label, 0) + 1
+
+    # 4) Convert to rows
+    src_rows = [{"type": k, "uses": v} for k, v in src_acc.items()]
+    tgt_rows = [{"type": k, "uses": v} for k, v in tgt_acc.items()]
+    src_rows.sort(key=lambda x: (-int(x.get("uses", 0)), x.get("type", "")))
+    tgt_rows.sort(key=lambda x: (-int(x.get("uses", 0)), x.get("type", "")))
+    return src_rows, tgt_rows
+
+    def _is_logstream(settings_json) -> bool:
+        if settings_json is None:
+            return False
+        try:
+            obj = settings_json if isinstance(settings_json, dict) else json.loads(settings_json)
+            if not isinstance(obj, dict):
+                return False
+            for k, v in obj.items():
+                if isinstance(k, str) and k.lower() == "logstreamstagingtask":
+                    if isinstance(v, str):
+                        return bool(v.strip())
+                    return True
+        except Exception:
+            return False
+        return False
+
+    src_acc, tgt_acc = {}, {}
+    for r in endpoints:
+        eid  = int(r["endpoint_id"] if isinstance(r, dict) else r[0])
+        role = str(r["role"] if isinstance(r, dict) else r[1]).upper().strip()
+        raw  = (str(r["type"] if isinstance(r, dict) else r[2]).strip()) or "(unknown)"
+        label = "Log Stream" if _is_logstream(settings_map.get(eid)) else canonize_to_master(raw, is_source=(role == "SOURCE"))
+        if role == "SOURCE":
+            src_acc[label] = src_acc.get(label, 0) + 1
+        elif role == "TARGET":
+            tgt_acc[label] = tgt_acc.get(label, 0) + 1
+
+    src_rows = [{"type": k, "uses": v} for k, v in src_acc.items()]
+    tgt_rows = [{"type": k, "uses": v} for k, v in tgt_acc.items()]
+    src_rows.sort(key=lambda x: (-x["uses"], x["type"]))
+    tgt_rows.sort(key=lambda x: (-x["uses"], x["type"]))
+    return src_rows, tgt_rows
 def _endpoint_mix_cards(doc: Document,
                         src_rows: List[Dict[str, Any]],
                         tgt_rows: List[Dict[str, Any]],
-                        from_tsv: bool):
+                        title: str,
+                        subtitle: Optional[str] = None):
     # Normalize into (label, count)
     src_items = [( _pretty_type(r.get("type")), int(r.get("uses", 0)) ) for r in src_rows]
     tgt_items = [( _pretty_type(r.get("type")), int(r.get("uses", 0)) ) for r in tgt_rows]
@@ -1125,7 +1685,9 @@ def _endpoint_mix_cards(doc: Document,
     tgt_items = tgt_items[:TOP]
     max_len = max(len(src_items), len(tgt_items)) or 1
 
-    _add_text(doc, f"Endpoint Mix{' (from TSV)' if from_tsv else ' (from repo)'}", size=12, bold=True)
+    _add_text(doc, title, size=12, bold=True)
+    if subtitle:
+        _add_text(doc, subtitle, size=9, italic=True)
     table = doc.add_table(rows=max_len + 1, cols=2)
     table.style = "Light Shading Accent 1"
     table.rows[0].cells[0].text = "Sources"
@@ -1147,7 +1709,7 @@ def _endpoint_mix_cards(doc: Document,
         else:
             table.rows[i + 1].cells[1].text = ""
 
-async def generate_customer_report_docx(customer_name: str) -> Tuple[bytes, str]:
+async def generate_customer_report_docx(customer_name: str, include_license: bool = True) -> Tuple[bytes, str]:
     async with connection() as conn:
         await _set_row_factory(conn)
         await _load_master_and_alias_from_db(conn)  # ensure masters/aliases ready
@@ -1241,84 +1803,46 @@ async def generate_customer_report_docx(customer_name: str) -> Tuple[bytes, str]
         )
         repo_totals = latest_repo_rows[0] if latest_repo_rows else {"tasks": 0, "endpoints": 0, "src": 0, "tgt": 0}
 
-        # ---------- Endpoint mix (prefer view) ----------
-        mix_src = await _try_all(
-            conn,
-            f"""
+        # ---------- Endpoint mix (prefer Repository JSON; fallback to QEM/TSV if empty) ----------
+        src_rows_used, tgt_rows_used = await _endpoint_mix_from_repo(conn, customer_id)
+        used_qem_view = False
+        from_tsv = False
+        if (not src_rows_used) and (not tgt_rows_used):
+            mix_src = await _try_all(conn, f"""
             SELECT type, uses FROM {SCHEMA}.v_qem_endpoint_mix
             WHERE customer_id=%s AND role='SOURCE'
             ORDER BY uses DESC, type
-            """,
-            (customer_id,),
-        )
-        mix_tgt = await _try_all(
-            conn,
-            f"""
+            """, (customer_id,))
+            mix_tgt = await _try_all(conn, f"""
             SELECT type, uses FROM {SCHEMA}.v_qem_endpoint_mix
             WHERE customer_id=%s AND role='TARGET'
             ORDER BY uses DESC, type
-            """,
-            (customer_id,),
-        )
-        if mix_src is None or mix_tgt is None:
-            src_types_tsv = await _all(
-                conn,
-                f"""
+            """, (customer_id,))
+            if mix_src is not None and mix_tgt is not None and (mix_src or mix_tgt):
+                src_rows_used, tgt_rows_used = mix_src, mix_tgt
+                used_qem_view = True
+                from_tsv = True
+            else:
+                src_types_tsv = await _all(conn, f"""
                 SELECT source_type AS type, COUNT(*) AS uses
                 FROM {SCHEMA}.qem_task_perf
                 WHERE customer_id=%s AND source_type IS NOT NULL
                 GROUP BY source_type
                 ORDER BY uses DESC, type
-                """,
-                (customer_id,),
-            )
-            tgt_types_tsv = await _all(
-                conn,
-                f"""
+                """, (customer_id,))
+                tgt_types_tsv = await _all(conn, f"""
                 SELECT target_type AS type, COUNT(*) AS uses
                 FROM {SCHEMA}.qem_task_perf
                 WHERE customer_id=%s AND target_type IS NOT NULL
                 GROUP BY target_type
                 ORDER BY uses DESC, type
-                """,
-                (customer_id,),
-            )
-            src_types_repo: List[Dict[str, Any]] = []
-            tgt_types_repo: List[Dict[str, Any]] = []
-            if not src_types_tsv or not tgt_types_tsv:
-                types_repo = await _all(
-                    conn,
-                    f"""
-                    WITH latest AS (
-                      SELECT server_id, MAX(created_at) AS last_ingest
-                      FROM {SCHEMA}.ingest_run
-                      WHERE customer_id=%s
-                      GROUP BY server_id
-                    ),
-                    runs AS (
-                      SELECT r.server_id, r.run_id
-                      FROM latest l
-                      JOIN {SCHEMA}.ingest_run r
-                        ON r.server_id=l.server_id AND r.created_at=l.last_ingest
-                    )
-                    SELECT role, db_settings_type AS type, COUNT(*) AS uses
-                    FROM {SCHEMA}.rep_database d
-                    JOIN runs u ON d.run_id=u.run_id
-                    GROUP BY role, db_settings_type
-                    """,
-                    (customer_id,),
-                )
-                src_types_repo = [r for r in types_repo if str(r.get("role")) == "SOURCE"]
-                tgt_types_repo = [r for r in types_repo if str(r.get("role")) == "TARGET"]
-            src_rows_used = (src_types_tsv or src_types_repo)
-            tgt_rows_used = (tgt_types_tsv or tgt_types_repo)
-            from_tsv = bool(src_types_tsv and tgt_types_tsv)
-        else:
-            src_rows_used = mix_src
-            tgt_rows_used = mix_tgt
-            from_tsv = True  # view is derived from TSV ingestion
+                """, (customer_id,))
+                src_rows_used = src_types_tsv or []
+                tgt_rows_used = tgt_types_tsv or []
+                from_tsv = bool(src_rows_used or tgt_rows_used)
+                used_qem_view = False
 
-        # ---------- Peak volumes (TSV) ----------
+# ---------- Peak volumes (TSV) ----------
         peak_fl = await _one(
             conn,
             f"""
@@ -1575,6 +2099,10 @@ async def generate_customer_report_docx(customer_name: str) -> Tuple[bytes, str]
 
     # ---------------- DOCX BUILD ----------------
     doc = Document()
+    try:
+        _apply_branding(doc)
+    except Exception:
+        pass
     _add_title(doc, "Customer Technical Overview")
     _add_text(doc, f"Customer: {customer_name}", size=10)
     doc.add_paragraph()
@@ -1594,6 +2122,7 @@ async def generate_customer_report_docx(customer_name: str) -> Tuple[bytes, str]
         ("Servers OOS", _fmt_int(oos_count), "FFE9E6"),
     ]
     _kpi_cards(doc, cards)
+    _add_text(doc, "Totals reflect the inventory discovered from Repository JSON ingests.", size=9, italic=True)
     doc.add_paragraph()
 
     # Versions table with posture
@@ -1608,11 +2137,14 @@ async def generate_customer_report_docx(customer_name: str) -> Tuple[bytes, str]
     doc.add_paragraph()
 
     # Endpoint Mix
-    _endpoint_mix_cards(doc, src_rows_used, tgt_rows_used, bool(from_tsv))
+    section_title = "Active Endpoint Mix (from QEM)" if used_qem_view else (f"Endpoint Mix{' (from TSV)' if from_tsv else ' (from repo)'}")
+    section_subtitle = ("Endpoints tied to active tasks in the latest QEM runs." if used_qem_view else None)
+    _endpoint_mix_cards(doc, src_rows_used, tgt_rows_used, section_title, section_subtitle)
     doc.add_paragraph()
 
     # License Usage - modern design (no "unlicensed in use")
-    _license_usage_section(
+    if include_license:
+        _license_usage_section(
         doc,
         used_source_types, used_target_types,
         lic_all_src, lic_all_tgt,
@@ -1663,6 +2195,8 @@ async def generate_customer_report_docx(customer_name: str) -> Tuple[bytes, str]
 
     except Exception as outer_e:
         _add_text(doc, f"⚠ MetricsLog summary failed: {type(outer_e).__name__}: {outer_e}", size=10, italic=True)
+    _add_note_panel(doc, "📝 Notes & Observations — 1. Executive Summary")
+
 
     doc.add_page_break()
 
@@ -1908,6 +2442,8 @@ async def generate_customer_report_docx(customer_name: str) -> Tuple[bytes, str]
             _add_text(doc, "No tasks found with DEBUG loggers in the latest ingest.", size=10, italic=True)
     except Exception as e:
         _add_text(doc, f"⚠ DEBUG logger insight failed: {type(e).__name__}: {e}", size=10, italic=True)
+    _add_note_panel(doc, "📝 Notes & Observations — 2. Customer Insights")
+
 
     doc.add_page_break()
 
@@ -1940,12 +2476,28 @@ async def generate_customer_report_docx(customer_name: str) -> Tuple[bytes, str]
             row.append(_fmt_int(cov_map.get((s_type, t_type), 0)))
         rows.append(tuple(row))
     _add_table(doc, headers=headers, rows=rows, style="Light Shading Accent 1")
+    _add_note_panel(doc, "📝 Notes & Observations — 3. Environment & Inventory")
+
     doc.add_page_break()
 
     # 4) Server Deep Dives
     _add_heading(doc, "4. Server Deep Dives", 1)
+    servers_by_name = {srv["server_name"]: srv for srv in servers}
     for s in [srv["server_name"] for srv in servers]:
+        # Diagnostics: log server mapping used for T90
+        _srv_row = servers_by_name.get(s)
+        srv_id = _srv_row.get("server_id") if _srv_row else None
+        try:
+            log.info("Deep-dive mapping: server_name=%s -> server_id=%s (customer_id=%s)", s, srv_id, customer_id)
+        except Exception:
+            pass
         _add_heading(doc, s, 2)
+        if _srv_row and "server_id" in _srv_row:
+            try:
+                await render_metricslog_90d_sections(doc, conn, customer_id, _srv_row["server_id"], s)
+            except Exception as _e:
+                log.exception("T90 MetricsLog section failed for %s: %s", s, _e)
+                _add_text(doc, f"⚠ T90 MetricsLog section failed for {s}: {_e}", size=9, italic=True)
         pair = primary_map.get(s)
         if pair:
             _add_text(doc, f"Primary pair: {_pretty_type(pair[0])} → {_pretty_type(pair[1])} ({_fmt_int(pair[2])} tasks)",
@@ -1978,12 +2530,407 @@ async def generate_customer_report_docx(customer_name: str) -> Tuple[bytes, str]
         doc.add_paragraph()
 
     # Index
+    _add_note_panel(doc, "📝 Notes & Observations — 4. Server Deep Dives")
+
     _add_heading(doc, "Index", 1)
     p = doc.add_paragraph("Update the index in Word: References → Update Table.")
     p.runs[0].italic = True
+
+
+    # === Latest Release Fixes (from DB) ===
+    try:
+        latest_label, groups = await _load_and_group_latest_release_issues(conn)
+        doc.add_page_break()
+        _render_latest_release_fixes_section(doc, latest_label, groups)
+        _add_note_panel(doc, "📝 Notes & Observations — Latest Release Fixes")
+    except Exception as e:
+        log.exception("Latest-release fixes section failed: %s: %s", type(e).__name__, e)
+        _add_text(doc, f"\u26A0 Latest-release fixes section failed: {type(e).__name__}: {e}", size=10, italic=True)
+    # === end Latest Release Fixes ===
 
     buf = io.BytesIO()
     doc.save(buf)
     buf.seek(0)
     filename = f"Customer_Technical_Overview_{customer_name}.docx".replace(" ", "_")
     return buf.read(), filename
+# ========= METRICSLOG T90 ENHANCEMENTS (Dynamic per-server window) ==================
+from dataclasses import dataclass
+from typing import Any, Dict, List
+
+from dataclasses import dataclass
+from typing import Dict, List, Any
+
+@dataclass
+class _T90TaskHealth:
+    tkey: str
+    uptime_pct: float
+    downtime_hours: float
+    restarts_per_day: float
+    error_stop_rate: float
+    median_session_minutes: float
+    throughput_rps: float
+    rows_moved: int
+    restarts_total: int | None = None
+    window_start: object | None = None
+    window_end: object | None = None
+
+def _fmt_pct_t90(x: float) -> str:
+    try:
+        return f"{float(x):.2f}%"
+    except Exception:
+        return str(x)
+
+# === T90 helpers (Endpoint Mix - Avg Uptime) ================================
+
+def _uptime_avg_numeric(row):
+    """
+    Return a 0..100 *average* uptime from a v_endpoint_perf_t90 row.
+    If the upstream view summed per-task percentages, normalize by task count.
+    """
+    try:
+        get = row.get if hasattr(row, "get") else (lambda k: row[k])
+        u = float(get("uptime_pct") or 0.0)
+        tasks = float(get("tasks") or 0.0)
+    except Exception:
+        u, tasks = 0.0, 0.0
+
+    # If someone accidentally aggregated by summing percentages, fix it.
+    if u > 100.0 and tasks > 0:
+        u = u / tasks
+
+    # Clamp to [0, 100] for display
+    if u < 0.0:
+        u = 0.0
+    if u > 100.0:
+        u = 100.0
+    return u
+
+
+def _uptime_bar(pct: float, width: int = 12) -> str:
+    """Tiny text progress bar (Word-safe) to make uptime scannable at a glance."""
+    try:
+        pct = max(0.0, min(float(pct), 100.0))
+    except Exception:
+        pct = 0.0
+    filled = int(round((pct / 100.0) * width))
+    if filled < 0: filled = 0
+    if filled > width: filled = width
+    return "█" * filled + "░" * (width - filled)
+
+
+def _uptime_avg_display(row) -> str:
+    """Human-friendly Avg Uptime cell text, e.g. '78.25%  ███████░░░░'."""
+    pct = _uptime_avg_numeric(row)
+    return f"{pct:.2f}%  {_uptime_bar(pct)}"
+    # If you prefer without the bar, use:
+    # return f"{pct:.2f}%"
+
+
+def _fmt_float_t90(x: float) -> str:
+    try:
+        return f"{float(x):.2f}"
+    except Exception:
+        return str(x)
+
+def _fmt_int_t90(x) -> str:
+    try:
+        return f"{int(x):,}"
+    except Exception:
+        return str(x)
+
+async def _t90_fetch_task_health(conn, customer_id: int, server_id: int) -> List[_T90TaskHealth]:
+    rows = await _try_all(conn, f"""
+        SELECT
+            t.tkey,
+            t.uptime_pct,
+            (t.downtime_sec/3600.0) AS downtime_hours,
+            t.restarts_per_day,
+            COALESCE(t.error_stop_rate,0.0) AS error_stop_rate,
+            COALESCE(t.median_session_minutes,0.0) AS median_session_minutes,
+            COALESCE(t.throughput_rps,0.0) AS throughput_rps,
+            COALESCE(t.rows_moved,0) AS rows_moved,
+            COALESCE(t.session_count,0) AS restarts_total,
+            w.window_start,
+            w.window_end
+        FROM {SCHEMA}.v_task_health_t90 t
+        JOIN {SCHEMA}.v_metrics_t90_window w USING (customer_id, server_id)
+        WHERE t.customer_id=%s AND t.server_id=%s
+    """, (customer_id, server_id)) or []
+    out: List[_T90TaskHealth] = []
+    for r in rows:
+        out.append(_T90TaskHealth(
+            tkey=str(r.get("tkey","")),
+            uptime_pct=float(r.get("uptime_pct") or 0),
+            downtime_hours=float(r.get("downtime_hours") or 0),
+            restarts_per_day=float(r.get("restarts_per_day") or 0),
+            error_stop_rate=float(r.get("error_stop_rate") or 0),
+            median_session_minutes=float(r.get("median_session_minutes") or 0),
+            throughput_rps=float(r.get("throughput_rps") or 0),
+            rows_moved=int(r.get("rows_moved") or 0),
+            restarts_total=int(r.get("restarts_total") or 0),
+            window_start=r.get("window_start"),
+            window_end=r.get("window_end"),
+        ))
+    return out
+
+async def _diag_t90(conn, customer_id: int, server_id: int):
+    try:
+        win = await _one(conn, f"SELECT count(*) AS c FROM {SCHEMA}.v_metrics_t90_window WHERE customer_id=%s AND server_id=%s", (customer_id, server_id))
+        th  = await _one(conn, f"SELECT count(*) AS c FROM {SCHEMA}.v_task_health_t90  WHERE customer_id=%s AND server_id=%s", (customer_id, server_id))
+        ep  = await _one(conn, f"SELECT count(*) AS c FROM {SCHEMA}.v_endpoint_perf_t90 WHERE customer_id=%s AND server_id=%s", (customer_id, server_id))
+        sids = await _try_all(conn, f"SELECT DISTINCT server_id FROM {SCHEMA}.v_task_health_t90 WHERE customer_id=%s ORDER BY 1", (customer_id,))
+        log.info("T90 diag schema=%s cust=%s srv=%s | window=%s task_health=%s endpoint=%s | th_server_ids=%s",
+                 SCHEMA, customer_id, server_id,
+                 (win and win.get('c') if win else None),
+                 (th and th.get('c') if th else None),
+                 (ep and ep.get('c') if ep else None),
+                 [r.get('server_id') if hasattr(r,'get') else r['server_id'] for r in (sids or [])])
+    except Exception as e:
+        log.exception("T90 diag failed for cust=%s srv=%s: %s", customer_id, server_id, e)
+
+async def _t90_fetch_endpoint_perf(conn, customer_id: int, server_id: int):
+    """Return endpoint performance rows for the 90-day window (v_endpoint_perf_t90)."""
+    rows = await _try_all(conn, f"""
+        SELECT role, family_id, tasks, rows_moved, uptime_pct, median_rps,
+               COALESCE(err_stop_rate,0.0) AS err_stop_rate,
+               COALESCE(median_session_minutes,0.0) AS median_session_minutes
+        FROM {SCHEMA}.v_endpoint_perf_t90
+        WHERE customer_id=%s AND server_id=%s
+        ORDER BY role, rows_moved DESC
+    """, (customer_id, server_id)) or []
+    return rows
+
+
+
+def _stable_score_t90(t):
+    """Composite stability score; higher is better."""
+    try:
+        u = max(0.0, min((t.uptime_pct or 0.0) / 100.0, 1.0))
+        r = 1.0 - max(0.0, min((t.restarts_per_day or 0.0) / 2.0, 1.0))
+        e = 1.0 - max(0.0, min((t.error_stop_rate or 0.0), 1.0))
+        d = max(0.0, min((t.median_session_minutes or 0.0) / 120.0, 1.0))
+        th = 0.0
+        if (t.throughput_rps or 0.0) >= 0.0:
+            th = min((t.throughput_rps or 0.0) / ((t.throughput_rps or 0.0) + 100.0), 1.0)
+        vol = min(max(float(t.rows_moved or 0), 0.0) / (max(float(t.rows_moved or 0), 0.0) + 10_000_000.0), 1.0)
+        return 0.35*u + 0.20*r + 0.15*e + 0.15*d + 0.10*th + 0.05*vol
+    except Exception:
+        return 0.0
+
+
+def _flapper_score_t90(t):
+    """Flakiness score; higher is worse."""
+    try:
+        rest = min(max((t.restarts_per_day or 0.0), 0.0) / 2.0, 1.0)
+        err  = min(max((t.error_stop_rate or 0.0), 0.0), 1.0)
+        short= 1.0 - min(max((t.median_session_minutes or 0.0), 0.0) / 120.0, 1.0)
+        up   = 1.0 - min(max((t.uptime_pct or 0.0)/100.0, 0.0), 1.0)
+        return 0.45*rest + 0.25*short + 0.20*err + 0.10*up
+    except Exception:
+        return 0.0
+
+def _add_table_t90(doc, headers, rows):
+    """Lightweight table builder for T90 sections.
+    - Aligns each row to the header length (pads/truncates)
+    - Uses a simple docx table style if available
+    """
+    # Prefer existing generic helper if present and compatible
+    try:
+        if callable(globals().get("_add_table")):
+            return _add_table(doc, headers, rows)
+    except Exception:
+        pass
+
+    t = doc.add_table(rows=1, cols=len(headers))
+    try:
+        t.style = "Light Shading Accent 1"
+    except Exception:
+        pass
+    hdr = t.rows[0].cells
+    for i, h in enumerate(headers):
+        r = hdr[i].paragraphs[0].add_run(str(h))
+        r.bold = True
+    for r in rows:
+        vals = list(r) if isinstance(r, (list, tuple)) else [r]
+        if len(vals) < len(headers):
+            vals += [""] * (len(headers) - len(vals))
+        elif len(vals) > len(headers):
+            vals = vals[:len(headers)]
+        cells = t.add_row().cells
+        for i, v in enumerate(vals):
+            cells[i].paragraphs[0].add_run("" if v is None else str(v))
+    return t
+
+
+async def render_metricslog_90d_sections(doc, conn, customer_id: int, server_id: int, server_name: str):
+    # Use a fresh connection for this section (avoids closed-conn issues)
+    async with connection() as conn_t90:
+        await _set_row_factory(conn_t90)
+
+        # Fetch data
+        t90        = await _t90_fetch_task_health(conn_t90, customer_id, server_id)
+        try:
+            endpoints  = await _t90_fetch_endpoint_perf(conn_t90, customer_id, server_id)
+        except NameError:
+            endpoints  = await _try_all(conn_t90, f"""
+                SELECT role, family_id, tasks, rows_moved, uptime_pct, median_rps,
+                       COALESCE(err_stop_rate,0.0) AS err_stop_rate,
+                       COALESCE(median_session_minutes,0.0) AS median_session_minutes
+                FROM {SCHEMA}.v_endpoint_perf_t90
+                WHERE customer_id=%s AND server_id=%s
+                ORDER BY role, rows_moved DESC
+            """, (customer_id, server_id)) or []
+        task_map   = await _load_task_name_map(conn_t90, customer_id, server_id)
+        family_map = await _load_family_name_map(conn_t90)
+
+        # Heading + window
+        _add_heading(doc, f"MetricsLog – 90-Day Window ({server_name})", level=3)
+        try:
+            if t90 and t90[0].window_start and t90[0].window_end:
+                _add_text(doc, f"Data window: {t90[0].window_start:%Y-%m-%d} → {t90[0].window_end:%Y-%m-%d} (based on latest log event).", size=9)
+        except Exception:
+            pass
+
+        # Summary and rankings
+        if not t90:
+            _add_text(doc, "No per-task health rows were found in the last 90 days for this server.", size=10, italic=True)
+        else:
+            avg_uptime = sum(t.uptime_pct for t in t90) / max(1, len(t90))
+            _add_text(doc, f"Avg Uptime (tasks): {_fmt_pct_t90(avg_uptime)}", size=9)
+
+            def _task_label(k: str) -> str:
+                return task_map.get(k, task_map.get(str(k), k))
+
+            stable_sorted  = sorted(t90, key=_stable_score_t90, reverse=True)
+            flapper_sorted = sorted(t90, key=_flapper_score_t90, reverse=True)
+            top_stable = [t for t in stable_sorted if t.rows_moved >= 10000][:3]
+            top_flap   = [t for t in flapper_sorted if (t.restarts_per_day >= 0.5 or t.error_stop_rate > 0.0)][:2]
+
+            if top_stable:
+                _add_heading(doc, "Top 3 Stable Producers", level=4)
+                _add_table_t90(doc,
+                    ["Task", "Uptime", "Restarts (total)", "Restarts/Day", "Median Run"],
+                    [[
+                        _task_label(ts.tkey),
+                        _fmt_pct_t90(ts.uptime_pct),
+                        _fmt_int_t90(ts.restarts_total or 0),
+                        _fmt_float_t90(ts.restarts_per_day),
+                        _fmt_duration_t90(ts.median_session_minutes),
+                    ] for ts in top_stable]
+                )
+            else:
+                _add_text(doc, "No stable producers met the minimum activity threshold.", size=9, italic=True)
+
+            if top_flap:
+                _add_heading(doc, "Top 2 Flappers", level=4)
+                _add_table_t90(doc,
+                    ["Task", "Uptime", "Restarts (total)", "Restarts/Day", "Median Run"],
+                    [[
+                        _task_label(tf.tkey),
+                        _fmt_pct_t90(tf.uptime_pct),
+                        _fmt_int_t90(tf.restarts_total or 0),
+                        _fmt_float_t90(tf.restarts_per_day),
+                        _fmt_duration_t90(tf.median_session_minutes),
+                    ] for tf in top_flap]
+                )
+            else:
+                _add_text(doc, "No flappers detected in the last 90 days.", size=9, italic=True)
+
+        # Endpoint mix (trimmed columns)
+        _add_heading(doc, "Endpoint Mix – Performance (Last 90 Days)", level=4)
+        if endpoints:
+            src = [e for e in endpoints if (e.get("role") if hasattr(e, "get") else e["role"]) == "SOURCE"]
+            tgt = [e for e in endpoints if (e.get("role") if hasattr(e, "get") else e["role"]) == "TARGET"]
+
+            def _get(row, k): return row.get(k) if hasattr(row, "get") else row[k]
+
+            if src:
+                _add_heading(doc, "Sources", level=5)
+                _add_table_t90(doc,
+                    ["Family", "Avg Uptime", "Median Run"],
+                    [[
+                        family_map.get(int(_get(r, "family_id") or 0), str(_get(r, "family_id"))),
+                        _uptime_avg_display(r),
+                        _fmt_duration_t90(_get(r, 'median_session_minutes')),
+                    ] for r in src]
+                )
+            if tgt:
+                _add_heading(doc, "Targets", level=5)
+                _add_table_t90(doc,
+                    ["Family", "Avg Uptime", "Median Run"],
+                    [[
+                        family_map.get(int(_get(r, "family_id") or 0), str(_get(r, "family_id"))),
+                        _uptime_avg_display(r),
+                        _fmt_duration_t90(_get(r, 'median_session_minutes')),
+                    ] for r in tgt]
+                )
+        else:
+            _add_text(doc, "No endpoint activity in the last 90 days.", size=9, italic=True)
+
+        # Server Top-5 Flappers
+        if t90:
+            _add_heading(doc, "Server Top-5 Flappers", level=4)
+            flapper_sorted = sorted(t90, key=_flapper_score_t90, reverse=True)
+            top5 = [t for t in flapper_sorted if (t.restarts_per_day >= 0.5 or t.error_stop_rate > 0.0)][:5]
+            if top5:
+                _add_table_t90(doc,
+                    ["Task", "Uptime", "Downtime (h)", "Restarts (total)", "Restarts/Day", "Median Run"],
+                    [[
+                        _task_label(t.tkey),
+                        _fmt_pct_t90(t.uptime_pct),
+                        _fmt_float_t90(t.downtime_hours),
+                        _fmt_int_t90(t.restarts_total or 0),
+                        _fmt_float_t90(t.restarts_per_day),
+                        _fmt_duration_t90(t.median_session_minutes),
+                    ] for t in top5]
+                )
+
+async def _load_task_name_map(conn, customer_id: int, server_id: int) -> Dict[str, str]:
+    """Resolve both task_id and task_uuid -> task_name using latest ingest on this server."""
+    rows = await _try_all(conn, f"""
+        WITH latest AS (
+          SELECT MAX(created_at) AS ts
+            FROM {SCHEMA}.ingest_run
+           WHERE customer_id=%s AND server_id=%s
+        )
+        SELECT t.task_id::text AS tid, t.task_uuid::text AS uuid, t.task_name::text AS nm
+          FROM {SCHEMA}.rep_task t
+          JOIN {SCHEMA}.ingest_run r ON r.run_id = t.run_id
+          JOIN latest L ON L.ts = r.created_at
+         WHERE r.customer_id=%s AND r.server_id=%s
+    """, (customer_id, server_id, customer_id, server_id)) or []
+    m: Dict[str, str] = {}
+    for r in rows:
+        tid = r.get("tid"); uuid = r.get("uuid"); nm = (r.get("nm") or "").strip()
+        if tid:  m[tid]  = nm or tid
+        if uuid: m[uuid] = nm or uuid
+    return m
+
+async def _load_family_name_map(conn) -> Dict[int, str]:
+    """Family id -> friendly name. Prefer endpoint_family; fallback to endpoint_alias_map."""
+    rows = await _try_all(conn, f"""
+        SELECT family_id::int AS fid, COALESCE(family_name, name)::text AS nm
+          FROM {SCHEMA}.endpoint_family
+        WHERE COALESCE(family_name, name) IS NOT NULL
+    """, ()) or []
+    m: Dict[int, str] = {int(r["fid"]): (r["nm"] or "").strip() for r in rows if r.get("fid") is not None and r.get("nm")}
+    if m:
+        return m
+    rows = await _try_all(conn, f"""
+        SELECT family_id::int AS fid, MIN(alias_value)::text AS nm
+          FROM {SCHEMA}.endpoint_alias_map
+         GROUP BY 1
+    """, ()) or []
+    for r in rows:
+        fid = r.get("fid"); nm = (r.get("nm") or "").strip()
+        if fid is not None:
+            m[int(fid)] = nm or str(fid)
+    return m
+
+async def _t90_fetch_window(conn, customer_id: int, server_id: int):
+    row = await _one(conn, f"""
+        SELECT window_start, window_end
+        FROM {SCHEMA}.v_metrics_t90_window
+        WHERE customer_id=%s AND server_id=%s
+    """, (customer_id, server_id))
+    return row if row else {}

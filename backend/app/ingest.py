@@ -46,14 +46,16 @@ def _get(dct: Dict[str, Any], *path, default=None):
     for p in path:
         if cur is None:
             return default
+        if not isinstance(cur, dict):
+            return default
         cur = cur.get(p)
     return cur if cur is not None else default
 
 
 def _first_str(*vals) -> Optional[str]:
     for v in vals:
-        if isinstance(v, str) and v:
-            return v
+        if isinstance(v, str) and v.strip():
+            return v.strip()
     return None
 
 
@@ -80,7 +82,7 @@ def _extract_replicate_version(payload: Dict[str, Any]) -> Optional[str]:
     return None
 
 
-# ---- new helpers for task-settings ----
+# ---- task-settings helpers ----
 def _sub(d: Dict[str, Any], *path) -> Dict[str, Any]:
     """Return nested dict or {} if missing/not a dict."""
     cur = d or {}
@@ -127,11 +129,10 @@ async def _exec(conn, sql: str, params: tuple):
         )
 
 
-# NEW: safe bulk insert
 async def _bulk_insert(conn, sql: str, rows: List[Tuple[Any, ...]]) -> None:
     """
-    Try connection.executemany(sql, rows). If not available (common for async wrappers),
-    fall back to per-row execute inside a short transaction. Always batches in its own txn.
+    Try connection.executemany(sql, rows). If not available, fall back to per-row execute.
+    Always batches in its own transaction.
     """
     try:
         em = getattr(conn, "executemany", None)
@@ -140,7 +141,6 @@ async def _bulk_insert(conn, sql: str, rows: List[Tuple[Any, ...]]) -> None:
                 await em(sql, rows)
             return
     except Exception:
-        # fall through to per-row execution
         pass
 
     async with conn.transaction():
@@ -736,7 +736,7 @@ async def _link_task_endpoints(conn, run_id: int, task_id: int, endpoints_by_nam
 
 
 # ------------------------------
-# FIXED: Persist explicit table list per task (correct path)
+# Persist explicit table list per task
 # ------------------------------
 async def _insert_task_tables(conn, run_id: int, task_id: int, task_obj: Dict[str, Any]) -> None:
     """
@@ -842,6 +842,7 @@ async def _ensure_task_logger_table(conn) -> None:
     except Exception as e:
         LOG.debug("rep_task_logger table creation skipped (non-fatal): %s", e)
 
+
 async def _insert_task_loggers(conn, run_id: int, task_id: int, task_obj: Dict[str, Any]) -> None:
     """
     Flatten task.loggers into rep_task_logger (one row per logger per task per run).
@@ -888,7 +889,7 @@ async def _insert_task_loggers(conn, run_id: int, task_id: int, task_obj: Dict[s
 
 
 # ------------------------------
-# NEW: Task settings – sections / normalized / KV
+# Task settings – sections / normalized / KV
 # ------------------------------
 async def _upsert_task_settings_sections(conn, run_id: int, task_id: int, tset: Dict[str, Any]):
     for sec in ("common_settings", "target_settings", "source_settings", "sorter_settings"):
@@ -1073,7 +1074,7 @@ async def _insert_task_settings(conn, run_id: int, task_id: int, task_obj: Dict[
 
 
 # ------------------------------
-# NEW: MetricsLog filtering + rollups
+# MetricsLog helpers + ingest
 # ------------------------------
 def _make_reader(file_obj=None, data_bytes: Optional[bytes] = None) -> csv.DictReader:
     """
@@ -1214,7 +1215,7 @@ async def _task_map_by_uuid(conn, customer_id: int, server_id: int, uuids: List[
 
 
 # ------------------------------
-# NEW: Replicate Metrics Log ingest (stream + batch + rollups)
+# Replicate Metrics Log ingest (stream + batch + rollups)
 # ------------------------------
 async def ingest_metrics_log(
     data_bytes: Optional[bytes],
@@ -1383,7 +1384,7 @@ async def ingest_metrics_log(
             except Exception as e:
                 LOG.debug("rep_metrics_task_total write skipped (non-fatal): %s", e)
 
-        # 2) Source×Target totals (skip rows with NULL family ids to avoid PK/FK issues)
+        # 2) Source×Target totals (skip rows with NULL family ids)
         if pair_acc:
             rows_pair = []
             for (sfid, tfid), a in pair_acc.items():
@@ -1437,7 +1438,9 @@ async def ingest_repository(repo_json: Dict[str, Any], customer_name: str, serve
       - flatten databases to rep_database + per-family detail tables (or JSON fallback)
       - flatten tasks, and link to endpoints by name
       - persist per-task explicit tables to rep_task_table
-      - NEW: persist task_settings (sections + normalized + KV)
+      - persist task loggers (levels) to rep_task_logger
+      - persist task_settings (sections + normalized + KV)
+    NOTE: server_name resolution and ZIP handling are performed in main.py.
     """
     cmd = (
         _get(repo_json, "cmd", "replication_definition")
@@ -1487,7 +1490,7 @@ async def ingest_repository(repo_json: Dict[str, Any], customer_name: str, serve
                 # logger levels for this task (if present)
                 await _insert_task_loggers(conn, run_id, task_id, obj)
 
-                # NEW: task settings (sections + normalized + kv)
+                # task settings (sections + normalized + kv)
                 await _insert_task_settings(conn, run_id, task_id, obj)
 
             LOG.info("[INGEST] Completed run_id=%s endpoints=%s tasks=%s", run_id, len(endpoint_ids), len(task_ids))
@@ -1496,3 +1499,9 @@ async def ingest_repository(repo_json: Dict[str, Any], customer_name: str, serve
                 "endpoints_inserted": len(endpoint_ids),
                 "tasks_inserted": len(task_ids)
             }
+
+
+__all__ = [
+    "ingest_repository",
+    "ingest_metrics_log",
+]
