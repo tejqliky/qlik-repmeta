@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import QlikSenseTab from "./QlikSenseTab"; // <- keep side-by-side with this file
+import QlikSenseTab from "./QlikSenseTab";
 
 /** Types */
 type Customer = { customer_id: number; customer_name: string };
@@ -41,7 +41,6 @@ const API_BASE = "http://127.0.0.1:8002";
 /** LocalStorage keys (per-browser persistence) */
 const LS_INCLUDE_LICENSE = "repmeta.include_license";
 const LS_NUDGE_SUPPRESS = "repmeta.nudge_license_suppress";
-const LS_ACTIVE_TAB = "repmeta.active_tab";
 
 /** ---- helpers ---- */
 async function fetchJson<T>(url: string, init?: RequestInit): Promise<T> {
@@ -55,30 +54,6 @@ async function fetchJson<T>(url: string, init?: RequestInit): Promise<T> {
     throw new Error(detail);
   }
   return (await res.json()) as T;
-}
-
-/** === QEM TSV header validation === */
-const REQUIRED_QEM_HEADERS = [
-  "State",
-  "Server",
-  "Task",
-  "Server Type",
-  "Source Name",
-  "Source Type",
-  "Target Name",
-  "Target Type",
-];
-
-async function validateQemTsvHeaders(file: File): Promise<{ ok: boolean; missing: string[]; headers: string[] }> {
-  const chunk = await file.slice(0, 512 * 1024).text();
-  const head = chunk.replace(/^\uFEFF/, "");
-  const firstLine = head.split(/\r?\n/, 1)[0] ?? "";
-  const headers = firstLine.split("\t").map((h) => h.trim());
-  if (!firstLine.includes("\t") || headers.length < 2) {
-    return { ok: false, missing: [...REQUIRED_QEM_HEADERS], headers };
-  }
-  const missing = REQUIRED_QEM_HEADERS.filter((h) => !headers.includes(h));
-  return { ok: missing.length === 0, missing, headers };
 }
 
 function toast(msg: string, kind: "ok" | "err" | "warn" = "ok") {
@@ -187,10 +162,8 @@ function LoaderOverlay({
   );
 }
 
-/* =========================
-   REPLICATE TAB (original)
-   ========================= */
-function ReplicateTab() {
+/** ---- main app ---- */
+export default function App() {
   // data
   const [customers, setCustomers] = useState<Customer[]>([]);
   const [servers, setServers] = useState<Server[]>([]);
@@ -205,6 +178,7 @@ function ReplicateTab() {
 
   // ui state
   const [newCustomerName, setNewCustomerName] = useState("");
+  const [activeTab, setActiveTab] = useState<"replicate" | "qliksense">("replicate");
   const [ingestMsg, setIngestMsg] = useState<string>("");
   const [serversUpsertMsg, setServersUpsertMsg] = useState<string>("");
   const [qemSummary, setQemSummary] = useState<any | null>(null);
@@ -252,12 +226,6 @@ function ReplicateTab() {
 
   const [qemPhase, setQemPhase] = useState<Phase>("idle");
   const [qemPct, setQemPct] = useState<number | null>(null);
-
-  const [qemHeaderDialog, setQemHeaderDialog] = useState<{ open: boolean; missing: string[]; headers: string[] }>({
-    open: false,
-    missing: [],
-    headers: [],
-  });
 
   const [licensePhase, setLicensePhase] = useState<Phase>("idle");
   const [licensePct, setLicensePct] = useState<number | null>(null);
@@ -415,11 +383,11 @@ function ReplicateTab() {
   async function handleAddCustomer() {
     const name = newCustomerName.trim();
     if (!name) return toast("Enter a customer name.", "err");
-    const dup = customers.find((c) => c.customer_name.trim().toLowerCase() === name.toLowerCase());
-    if (dup) {
-      setCustomerId(dup.customer_id);
+    if (duplicateCustomer) {
+      // If duplicate, switch selection instead
+      setCustomerId(duplicateCustomer.customer_id);
       setNewCustomerName("");
-      toast(`Switched to existing customer "${dup.customer_name}".`, "ok");
+      toast(`Switched to existing customer "${duplicateCustomer.customer_name}".`, "ok");
       return;
     }
     try {
@@ -551,6 +519,7 @@ function ReplicateTab() {
           }
 
           if (t === "job_completed") {
+            // summary (note the parens to avoid ?? / || precedence issue)
             setRepoTotal((payload.total ?? Object.keys(repoItems).length) || 1);
             setRepoSuccess(payload.success ?? 0);
             setRepoFailed(payload.failed ?? 0);
@@ -573,6 +542,7 @@ function ReplicateTab() {
       };
 
       es.onerror = () => {
+        // Network hiccups are common; if job already finished we'll be in "done"
         setRepoPhase((prev) => (prev === "done" ? "done" : "error"));
         if (repoPhase !== "done") {
           toast("SSE stream error during repository ingest.", "err");
@@ -590,7 +560,7 @@ function ReplicateTab() {
     }
   }
 
-  /** ---------- QEM & others (mark 'done' on success) ---------- */
+  /** ---------- QEM & others (now mark 'done' on success) ---------- */
   async function handleUploadQemServersTsv() {
     if (!customerName) return toast("Pick a customer first.", "err");
     const file = qemServersFileRef.current?.files?.[0];
@@ -604,6 +574,7 @@ function ReplicateTab() {
       fd.append("customer_name", customerName);
 
       const j = await xhrPost(`${API_BASE}/ingest-qem-servers-file`, fd, setQemServersPct, setQemServersPhase);
+      // ✅ mark done for non-SSE flows
       setQemServersPhase("done");
       setQemServersPct(null);
 
@@ -622,20 +593,6 @@ function ReplicateTab() {
     if (!customerName) return toast("Pick a customer first.", "err");
     const file = qemFileRef.current?.files?.[0];
     if (!file) return toast("Choose a QEM Metrics TSV file.", "err");
-
-    // Client-side header validation
-    try {
-      const v = await validateQemTsvHeaders(file);
-      if (!v.ok) {
-        toast("QEM TSV is missing required columns. See details.", "err");
-        setQemHeaderDialog({ open: true, missing: v.missing, headers: v.headers });
-        return;
-      }
-    } catch (e: any) {
-      toast(`Could not read TSV: ${e?.message || e}`, "err");
-      return;
-    }
-
     try {
       setBusy(true);
       setQemPhase("idle");
@@ -673,6 +630,7 @@ function ReplicateTab() {
 
       setQemSummary({ ...totals, match_mode, details });
 
+      // ✅ mark done for non-SSE flows
       setQemPhase("done");
       setQemPct(null);
 
@@ -706,6 +664,7 @@ function ReplicateTab() {
         targets: j?.licensed_targets ?? [],
       });
 
+      // ✅ mark done for non-SSE flows
       setLicensePhase("done");
       setLicensePct(null);
 
@@ -741,6 +700,7 @@ function ReplicateTab() {
         dup_count: dupCount,
       });
 
+      // ✅ mark done for non-SSE flows
       setMetricsPhase("done");
       setMetricsUploadPct(null);
 
@@ -754,9 +714,10 @@ function ReplicateTab() {
     }
   }
 
-  // License toggle UX
+  // --- License toggle UX: default OFF + nudge when turning ON (persisted) ---
   function requestToggleIncludeLicense() {
     if (!includeLicense) {
+      // Turning ON: show nudge unless suppressed
       if (!suppressLicenseNudge) {
         setShowLicenseNudge(true);
         return;
@@ -764,6 +725,7 @@ function ReplicateTab() {
       setIncludeLicense(true);
       toast("License Usage will be included in the report (internal only).", "warn");
     } else {
+      // Turning OFF: just switch
       setIncludeLicense(false);
       toast("License Usage excluded from report.", "ok");
     }
@@ -809,7 +771,7 @@ function ReplicateTab() {
     if (!confirm("Delete all ingested data for this customer?")) return;
     try {
       setBusy(true);
-      setDeleting(true);
+      setDeleting(true); // show overlay
       const qs = deleteAlsoServers ? "?drop_servers=1" : "";
       const res = await fetch(`${API_BASE}/customers/${customerId}/data${qs}`, { method: "DELETE" });
       if (!res.ok) {
@@ -835,7 +797,7 @@ function ReplicateTab() {
     }
   }
 
-  // Upload card component (generic)
+  // Upload card component (generic) with progress
   function UploadCard({ title, icon, description, fileRef, accept, onUpload, phase, pct }: any) {
     const [fileName, setFileName] = useState("");
     const [isDragging, setIsDragging] = useState(false);
@@ -894,6 +856,7 @@ function ReplicateTab() {
             {phase === "uploading" || phase === "processing" ? "Processing…" : "Upload & Process"}
           </button>
 
+          {/* Progress feedback */}
           {phase !== "idle" && (
             <div className="rounded bg-gray-50 border border-gray-200 p-3 space-y-2">
               {phase === "uploading" && (
@@ -1005,6 +968,7 @@ function ReplicateTab() {
             )}
           </div>
 
+          {/* Progress feedback */}
           {repoPhase !== "idle" && (
             <div className="rounded bg-gray-50 border border-gray-200 p-3 space-y-2">
               {repoPhase === "uploading" && (
@@ -1051,6 +1015,7 @@ function ReplicateTab() {
             </div>
           )}
 
+          {/* SSE Timeline */}
           {(repoPhase === "processing" || repoPhase === "done") && items.length > 0 && (
             <div className="rounded border border-gray-200 bg-white">
               <div className="px-3 py-2 border-b border-gray-200 text-xs text-gray-600">
@@ -1097,7 +1062,7 @@ function ReplicateTab() {
     );
   }
 
-  // Specialized Metrics Log card
+  // Specialized Metrics Log card (needs server selector)
   function MetricsLogCard() {
     const [fileName, setFileName] = useState("");
     const [isDragging, setIsDragging] = useState(false);
@@ -1170,6 +1135,7 @@ function ReplicateTab() {
             {metricsPhase === "uploading" || metricsPhase === "processing" ? "Processing…" : "Upload & Process"}
           </button>
 
+          {/* Progress feedback */}
           {metricsPhase !== "idle" && (
             <div className="rounded bg-gray-50 border border-gray-200 p-3 space-y-2">
               {metricsPhase === "uploading" && (
@@ -1200,564 +1166,600 @@ function ReplicateTab() {
   }
 
   return (
-    <div className="mx-auto max-w-[1400px] px-6 py-8">
-      <div className="grid grid-cols-1 lg:grid-cols-4 gap-6">
-        {/* Sidebar */}
-        <div className="lg:col-span-1 space-y-6">
-          {/* Progress Steps */}
-          <div className="bg-white border border-gray-200 rounded p-5">
-            <div className="flex items-center gap-2 mb-5">
-              <div className="h-1 w-1 rounded-full bg-green-600" />
-              <h3 className="text-sm font-semibold text-gray-900 uppercase tracking-wide">Pipeline Progress</h3>
-            </div>
-
-            <div className="space-y-2">
-              {[
-                { num: 1, label: "Add Customer", done: customers.length > 0 },
-                { num: 2, label: "Select Snapshot", done: customerId !== null },
-                { num: 3, label: "Upload Repository", done: servers.length > 0 },
-                { num: 4, label: "Upload Servers TSV", done: !!serversUpsertMsg },
-                { num: 5, label: "Upload QEM Metrics", done: !!qemSummary },
-                { num: 6, label: "Upload Metrics Log", done: !!metricsSummary },
-                { num: 7, label: "Upload Task Log (License)", done: !!licenseSummary },
-                { num: 8, label: "Generate Report", done: false },
-              ].map((step) => {
-                const isActive = step.num === currentStep;
-                return (
-                  <div
-                    key={step.num}
-                    className={`rounded p-3 transition-all ${
-                      step.done
-                        ? "bg-green-50 border border-green-200"
-                        : isActive
-                        ? "bg-blue-50 border border-blue-200"
-                        : "bg-gray-50 border border-gray-200"
-                    }`}
-                  >
-                    <div className="flex items-center gap-3">
-                      <div
-                        className={`h-6 w-6 shrink-0 rounded-full grid place-items-center text-xs font-semibold ${
-                          step.done
-                            ? "bg-green-600 text-white"
-                            : isActive
-                            ? "bg-blue-600 text-white"
-                            : "bg-gray-200 text-gray-600"
-                        }`}
-                      >
-                        {step.done ? "✓" : step.num}
-                      </div>
-                      <span className={`text-sm font-medium ${step.done || isActive ? "text-gray-900" : "text-gray-600"}`}>
-                        {step.label}
-                      </span>
-                    </div>
-                  </div>
-                );
-              })}
-            </div>
-          </div>
-
-          {/* Stats Card */}
-          <div className="bg-white border border-gray-200 rounded p-5">
-            <div className="flex items-center gap-2 mb-5">
-              <div className="h-1 w-1 rounded-full bg-green-600" />
-              <h3 className="text-sm font-semibold text-gray-900 uppercase tracking-wide">Analytics</h3>
-            </div>
-
-            <div className="space-y-4">
-              <div className="rounded bg-gradient-to-br from-green-50 to-green-100 border border-green-200 p-4">
-                <div className="text-xs font-semibold text-green-800 uppercase tracking-wide mb-1">Customer</div>
-                <div className="text-lg font-bold text-gray-900 truncate">{customerName || "—"}</div>
-              </div>
-
-              <div className="grid grid-cols-2 gap-3">
-                <div className="rounded bg-blue-50 border border-blue-200 p-3">
-                  <div className="text-xs font-semibold text-blue-800 uppercase tracking-wide mb-1">Servers</div>
-                  <div className="text-xl font-bold text-gray-900">{servers.length}</div>
-                </div>
-
-                <div className="rounded bg-purple-50 border border-purple-200 p-3">
-                  <div className="text-xs font-semibold text-purple-800 uppercase tracking-wide mb-1">Tasks</div>
-                  <div className="text-xl font-bold text-gray-900">{qemSummary?.matched ?? "—"}</div>
-                </div>
-              </div>
-
-              <div className="rounded bg-indigo-50 border border-indigo-200 p-3">
-                <div className="text-xs font-semibold text-indigo-800 uppercase tracking-wide mb-1">QEM Events</div>
-                <div className="text-2xl font-bold text-gray-900">
-                  {qemSummary?.rows?.toLocaleString() ?? "—"}
-                </div>
-              </div>
-
-              {metricsSummary && (
-                <div className="rounded bg-orange-50 border border-orange-200 p-3">
-                  <div className="text-xs font-semibold text-orange-800 uppercase tracking-wide mb-1">Metrics Log</div>
-                  <div className="text-gray-900">
-                    <div className="text-lg font-bold">
-                      {metricsSummary.rows?.toLocaleString?.() ?? metricsSummary.rows ?? 0} rows
-                    </div>
-                    <div className="text-xs text-gray-700 mt-1">
-                      Inserted {metricsSummary.inserted ?? 0} · Matched {metricsSummary.matched ?? 0}
-                      {typeof metricsSummary.dup_count === "number" && metricsSummary.dup_count > 0 && (
-                        <> · Duplicates {metricsSummary.dup_count}</>
-                      )}
-                    </div>
-                  </div>
-                </div>
-              )}
-            </div>
-          </div>
-        </div>
-
-        {/* Main Workbench */}
-        <div className="lg:col-span-3 space-y-6">
-          {/* Customer Management */}
-          <div className="bg-white border border-gray-200 rounded p-6">
-            <div className="flex items-center justify-between mb-4">
+    <div className="min-h-screen bg-gray-50">
+      {/* Header */}
+      <header className="bg-white border-b border-gray-200 sticky top-0 z-40 shadow-sm">
+        <div className="mx-auto max-w-[1400px] px-6 py-4">
+          <div className="flex items-center justify-between gap-6">
+            <div className="flex items-center gap-4">
               <div className="flex items-center gap-3">
-                <span className="text-2xl">🏢</span>
-                <h2 className="text-lg font-semibold text-gray-900">Customer Management</h2>
-              </div>
-              <div className="flex items-center gap-2">
-                <button
-                  className="rounded border border-gray-300 bg-white hover:bg-gray-50 px-4 h-9 text-sm text-gray-700 font-medium transition-colors"
-                  onClick={handleHomeReset}
-                >
-                  🏠 Reset
-                </button>
-                <button
-                  className="rounded bg-green-600 hover:bg-green-700 disabled:bg-gray-300 disabled:cursor-not-allowed px-5 h-9 text-sm text-white font-semibold transition-colors"
-                  onClick={downloadCustomerDocx}
-                  disabled={!customers.find((c) => c.customer_id === customerId)}
-                >
-                  📥 Download Report
-                </button>
-              </div>
-            </div>
-
-            {/* Tip banner */}
-            <div className="mb-6 rounded-lg border border-blue-200 bg-blue-50 px-4 py-3 text-sm text-blue-900 flex items-start gap-3">
-              <div className="mt-0.5">💡</div>
-              <div>
-                <span className="font-semibold">Tip:</span> Usually you’ll{" "}
-                <span className="font-medium">select an existing customer</span> on the right. Use{" "}
-                <span className="font-medium">Create New Customer</span> only if it isn’t already listed.
-              </div>
-            </div>
-
-            <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-              <div className="space-y-2">
-                <label className="block text-sm font-semibold text-gray-700">Create New Customer</label>
-                <div className="flex gap-2">
-                  <input
-                    type="text"
-                    placeholder="Add only if not listed…"
-                    value={newCustomerName}
-                    onChange={(e) => setNewCustomerName(e.target.value)}
-                    onKeyDown={(e) => e.key === "Enter" && handleAddCustomer()}
-                    className={`flex-1 rounded border bg-white px-3 h-10 text-sm text-gray-900 placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-green-500 focus:border-transparent ${
-                      duplicateCustomer ? "border-amber-400" : "border-gray-300"
-                    }`}
-                    aria-describedby="customer-add-hint"
+                <svg className="h-8 w-8" viewBox="0 0 32 32" fill="none">
+                  <rect width="32" height="32" rx="4" fill="#009845" />
+                  <path
+                    d="M16 8L8 12v8l8 4 8-4v-8l-8-4zm0 2.5l5.5 2.75v5.5L16 21.5l-5.5-2.75v-5.5L16 10.5z"
+                    fill="white"
                   />
-                  <button
-                    onClick={handleAddCustomer}
-                    disabled={!!duplicateCustomer}
-                    className={`rounded px-5 h-10 text-sm text-white font-semibold transition-colors ${
-                      duplicateCustomer ? "bg-gray-300 cursor-not-allowed" : "bg-green-600 hover:bg-green-700"
-                    }`}
-                    title={duplicateCustomer ? "This customer already exists — select it instead" : "Add customer"}
-                  >
-                    Add
-                  </button>
-                </div>
+                </svg>
+                <div>
+                  <div className="text-xl font-semibold text-gray-900">RepMeta Console</div>
 
-                {/* Smart duplicate guard */}
-                {duplicateCustomer ? (
-                  <div
-                    id="customer-add-hint"
-                    className="mt-2 flex items-center justify-between rounded border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-900"
-                  >
-                    <span>Looks like “{duplicateCustomer.customer_name}” already exists.</span>
+                  {/* Home Tabs */}
+                  <div className="hidden md:inline-flex ml-6 rounded-2xl border shadow-sm overflow-hidden bg-white">
                     <button
-                      className="ml-3 rounded bg-amber-600 hover:bg-amber-700 text-white px-2.5 py-1 text-xs font-semibold"
-                      onClick={() => {
-                        setCustomerId(duplicateCustomer.customer_id);
-                        setNewCustomerName("");
-                        toast(`Switched to existing customer "${duplicateCustomer.customer_name}".`, "ok");
-                      }}
+                      onClick={() => setActiveTab("replicate")}
+                      className={`px-4 py-1.5 text-sm ${activeTab === "replicate" ? "bg-black text-white" : "bg-white text-gray-700"}`}
                     >
-                      Select existing
+                      Qlik Replicate
+                    </button>
+                    <button
+                      onClick={() => setActiveTab("qliksense")}
+                      className={`px-4 py-1.5 text-sm ${activeTab === "qliksense" ? "bg-black text-white" : "bg-white text-gray-700"}`}
+                    >
+                      Qlik Sense
                     </button>
                   </div>
-                ) : (
-                  <div id="customer-add-hint" className="text-xs text-gray-500 mt-1">
-                    Enter only if the customer isn’t in the list.
-                  </div>
-                )}
-              </div>
 
-              <div className="space-y-2">
-                <label className="block text-sm font-semibold text-gray-700">Select Active Customer</label>
-                <select
-                  className="w-full rounded border border-gray-300 bg-white px-3 h-10 text-sm text-gray-900 focus:outline-none focus:ring-2 focus:ring-green-500 focus:border-transparent"
-                  value={customerId ?? ""}
-                  onChange={(e) => setCustomerId(e.target.value ? Number(e.target.value) : null)}
-                >
-                  <option value="">Select a customer...</option>
-                  {customers.map((c) => (
-                    <option key={c.customer_id} value={c.customer_id}>
-                      {c.customer_name}
-                    </option>
-                  ))}
-                </select>
+                  <div className="text-xs text-gray-600">Data Pipeline & Analytics Platform</div>
+                </div>
               </div>
             </div>
 
-            {/* Server Grid */}
-            {customerId && (
-              <div className="mt-6 space-y-4">
-                <div className="flex items-center justify-between">
-                  <h3 className="text-base font-semibold text-gray-900 flex items-center gap-2">
-                    <span className="text-xl">🖥️</span>
-                    Connected Servers
-                  </h3>
-                  <div className="px-3 py-1 rounded-full bg-green-100 border border-green-300">
-                    <span className="text-xs font-semibold text-green-800">{servers.length} Active</span>
+            <div className="flex items-center gap-3">
+              {activeTab === "replicate" && (
+                <>
+                  {/* License toggle (compact) */}
+                  <div className="hidden sm:flex items-center gap-2 pr-2 border-r border-gray-200">
+                    <span className="text-xs text-gray-600">🔐 License Usage</span>
+                    <button
+                      type="button"
+                      onClick={requestToggleIncludeLicense}
+                      title="Include or exclude the License Usage section in the report"
+                      className={`relative inline-flex h-6 w-10 items-center rounded-full transition-colors ${
+                        includeLicense ? "bg-green-600" : "bg-gray-300"
+                      }`}
+                    >
+                      <span
+                        className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${
+                          includeLicense ? "translate-x-5" : "translate-x-1"
+                        }`}
+                      />
+                    </button>
                   </div>
+
+                  {includeLicense && (
+                    <span
+                      className="hidden md:inline-flex items-center gap-1 rounded-full border px-2.5 h-9 text-xs font-medium bg-amber-50 border-amber-300 text-amber-900"
+                      title="This report will include License Usage details; avoid sharing with customers"
+                    >
+                      ⚠️ Includes license info
+                    </span>
+                  )}
+
+                  <button
+                    className="rounded border border-gray-300 bg-white hover:bg-gray-50 px-4 h-9 text-sm text-gray-700 font-medium transition-colors"
+                    onClick={handleHomeReset}
+                    disabled={exporting}
+                  >
+                    🏠 Reset
+                  </button>
+                  <button
+                    className="rounded bg-green-600 hover:bg-green-700 disabled:bg-gray-300 disabled:cursor-not-allowed px-5 h-9 text-sm text-white font-semibold transition-colors"
+                    onClick={downloadCustomerDocx}
+                    disabled={exporting || !customerName}
+                  >
+                    {exporting ? "⏳ Generating…" : "📥 Download Report"}
+                  </button>
+                </>
+              )}
+            </div>
+          </div>
+        </div>
+      </header>
+
+      {/* Main Content */}
+      {activeTab === "replicate" && (
+        <main className="mx-auto max-w-[1400px] px-6 py-8">
+          <div className="grid grid-cols-1 lg:grid-cols-4 gap-6">
+            {/* Sidebar */}
+            <div className="lg:col-span-1 space-y-6">
+              {/* Progress Steps */}
+              <div className="bg-white border border-gray-200 rounded p-5">
+                <div className="flex items-center gap-2 mb-5">
+                  <div className="h-1 w-1 rounded-full bg-green-600" />
+                  <h3 className="text-sm font-semibold text-gray-900 uppercase tracking-wide">Pipeline Progress</h3>
                 </div>
 
-                {servers.length === 0 ? (
-                  <div className="rounded border-2 border-dashed border-gray-300 bg-gray-50 p-12 text-center">
-                    <div className="text-5xl mb-3">📡</div>
-                    <div className="text-sm text-gray-600">No servers detected yet. Upload repository JSON to begin.</div>
-                  </div>
-                ) : (
-                  <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
-                    {servers.map((s) => (
+                <div className="space-y-2">
+                  {[
+                    { num: 1, label: "Add Customer", done: customers.length > 0 },
+                    { num: 2, label: "Select Snapshot", done: customerId !== null },
+                    { num: 3, label: "Upload Repository", done: servers.length > 0 },
+                    { num: 4, label: "Upload Servers TSV", done: !!serversUpsertMsg },
+                    { num: 5, label: "Upload QEM Metrics", done: !!qemSummary },
+                    { num: 6, label: "Upload Metrics Log", done: !!metricsSummary },
+                    { num: 7, label: "Upload Task Log (License)", done: !!licenseSummary },
+                    { num: 8, label: "Generate Report", done: false },
+                  ].map((step) => {
+                    const isActive = step.num === currentStep;
+                    return (
                       <div
-                        key={s.server_id}
-                        className="rounded border border-gray-200 bg-white hover:border-gray-300 hover:shadow p-4 transition-all"
+                        key={step.num}
+                        className={`rounded p-3 transition-all ${
+                          step.done
+                            ? "bg-green-50 border border-green-200"
+                            : isActive
+                            ? "bg-blue-50 border border-blue-200"
+                            : "bg-gray-50 border border-gray-200"
+                        }`}
                       >
-                        <div className="flex items-start justify-between mb-2">
-                          <div className="h-8 w-8 rounded bg-gray-100 grid place-items-center text-lg">🖥️</div>
-                          <div className="h-2 w-2 rounded-full bg-green-500" />
-                        </div>
-                        <div className="font-semibold text-sm text-gray-900 mb-1">{s.server_name}</div>
-                        <div className="text-xs text-gray-500">
-                          {s.environment ? `Env: ${s.environment}` : "No environment"}
+                        <div className="flex items-center gap-3">
+                          <div
+                            className={`h-6 w-6 shrink-0 rounded-full grid place-items-center text-xs font-semibold ${
+                              step.done
+                                ? "bg-green-600 text-white"
+                                : isActive
+                                ? "bg-blue-600 text-white"
+                                : "bg-gray-200 text-gray-600"
+                            }`}
+                          >
+                            {step.done ? "✓" : step.num}
+                          </div>
+                          <span className={`text-sm font-medium ${step.done || isActive ? "text-gray-900" : "text-gray-600"}`}>
+                            {step.label}
+                          </span>
                         </div>
                       </div>
-                    ))}
+                    );
+                  })}
+                </div>
+              </div>
+
+              {/* Stats Card */}
+              <div className="bg-white border border-gray-200 rounded p-5">
+                <div className="flex items-center gap-2 mb-5">
+                  <div className="h-1 w-1 rounded-full bg-green-600" />
+                  <h3 className="text-sm font-semibold text-gray-900 uppercase tracking-wide">Analytics</h3>
+                </div>
+
+                <div className="space-y-4">
+                  <div className="rounded bg-gradient-to-br from-green-50 to-green-100 border border-green-200 p-4">
+                    <div className="text-xs font-semibold text-green-800 uppercase tracking-wide mb-1">Customer</div>
+                    <div className="text-lg font-bold text-gray-900 truncate">{customerName || "—"}</div>
+                  </div>
+
+                  <div className="grid grid-cols-2 gap-3">
+                    <div className="rounded bg-blue-50 border border-blue-200 p-3">
+                      <div className="text-xs font-semibold text-blue-800 uppercase tracking-wide mb-1">Servers</div>
+                      <div className="text-xl font-bold text-gray-900">{servers.length}</div>
+                    </div>
+
+                    <div className="rounded bg-purple-50 border border-purple-200 p-3">
+                      <div className="text-xs font-semibold text-purple-800 uppercase tracking-wide mb-1">Tasks</div>
+                      <div className="text-xl font-bold text-gray-900">{qemSummary?.matched ?? "—"}</div>
+                    </div>
+                  </div>
+
+                  <div className="rounded bg-indigo-50 border border-indigo-200 p-3">
+                    <div className="text-xs font-semibold text-indigo-800 uppercase tracking-wide mb-1">QEM Events</div>
+                    <div className="text-2xl font-bold text-gray-900">
+                      {qemSummary?.rows?.toLocaleString() ?? "—"}
+                    </div>
+                  </div>
+
+                  {metricsSummary && (
+                    <div className="rounded bg-orange-50 border border-orange-200 p-3">
+                      <div className="text-xs font-semibold text-orange-800 uppercase tracking-wide mb-1">Metrics Log</div>
+                      <div className="text-gray-900">
+                        <div className="text-lg font-bold">
+                          {metricsSummary.rows?.toLocaleString?.() ?? metricsSummary.rows ?? 0} rows
+                        </div>
+                        <div className="text-xs text-gray-700 mt-1">
+                          Inserted {metricsSummary.inserted ?? 0} · Matched {metricsSummary.matched ?? 0}
+                          {typeof metricsSummary.dup_count === "number" && metricsSummary.dup_count > 0 && (
+                            <> · Duplicates {metricsSummary.dup_count}</>
+                          )}
+                        </div>
+                      </div>
+                    </div>
+                  )}
+                </div>
+              </div>
+            </div>
+
+            {/* Main Workbench */}
+            <div className="lg:col-span-3 space-y-6">
+              {/* Customer Management */}
+              <div className="bg-white border border-gray-200 rounded p-6">
+                <div className="flex items-center gap-3 mb-4">
+                  <span className="text-2xl">🏢</span>
+                  <h2 className="text-lg font-semibold text-gray-900">Customer Management</h2>
+                </div>
+
+                {/* Tip banner */}
+                <div className="mb-6 rounded-lg border border-blue-200 bg-blue-50 px-4 py-3 text-sm text-blue-900 flex items-start gap-3">
+                  <div className="mt-0.5">💡</div>
+                  <div>
+                    <span className="font-semibold">Tip:</span> Usually you’ll{" "}
+                    <span className="font-medium">select an existing customer</span> on the right. Use{" "}
+                    <span className="font-medium">Create New Customer</span> only if it isn’t already listed.
+                  </div>
+                </div>
+
+                <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+                  <div className="space-y-2">
+                    <label className="block text-sm font-semibold text-gray-700">Create New Customer</label>
+                    <div className="flex gap-2">
+                      <input
+                        type="text"
+                        placeholder="Add only if not listed…"
+                        value={newCustomerName}
+                        onChange={(e) => setNewCustomerName(e.target.value)}
+                        onKeyDown={(e) => e.key === "Enter" && handleAddCustomer()}
+                        className={`flex-1 rounded border bg-white px-3 h-10 text-sm text-gray-900 placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-green-500 focus:border-transparent ${
+                          duplicateCustomer ? "border-amber-400" : "border-gray-300"
+                        }`}
+                        aria-describedby="customer-add-hint"
+                      />
+                      <button
+                        onClick={handleAddCustomer}
+                        disabled={!!duplicateCustomer}
+                        className={`rounded px-5 h-10 text-sm text-white font-semibold transition-colors ${
+                          duplicateCustomer ? "bg-gray-300 cursor-not-allowed" : "bg-green-600 hover:bg-green-700"
+                        }`}
+                        title={duplicateCustomer ? "This customer already exists — select it instead" : "Add customer"}
+                      >
+                        Add
+                      </button>
+                    </div>
+
+                    {/* Smart duplicate guard */}
+                    {duplicateCustomer ? (
+                      <div
+                        id="customer-add-hint"
+                        className="mt-2 flex items-center justify-between rounded border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-900"
+                      >
+                        <span>Looks like “{duplicateCustomer.customer_name}” already exists.</span>
+                        <button
+                          className="ml-3 rounded bg-amber-600 hover:bg-amber-700 text-white px-2.5 py-1 text-xs font-semibold"
+                          onClick={() => {
+                            setCustomerId(duplicateCustomer.customer_id);
+                            setNewCustomerName("");
+                            toast(`Switched to existing customer "${duplicateCustomer.customer_name}".`, "ok");
+                          }}
+                        >
+                          Select existing
+                        </button>
+                      </div>
+                    ) : (
+                      <div id="customer-add-hint" className="text-xs text-gray-500 mt-1">
+                        Enter only if the customer isn’t in the list.
+                      </div>
+                    )}
+                  </div>
+
+                  <div className="space-y-2">
+                    <label className="block text-sm font-semibold text-gray-700">Select Active Customer</label>
+                    <select
+                      className="w-full rounded border border-gray-300 bg-white px-3 h-10 text-sm text-gray-900 focus:outline-none focus:ring-2 focus:ring-green-500 focus:border-transparent"
+                      value={customerId ?? ""}
+                      onChange={(e) => setCustomerId(e.target.value ? Number(e.target.value) : null)}
+                    >
+                      <option value="">Select a customer...</option>
+                      {customers.map((c) => (
+                        <option key={c.customer_id} value={c.customer_id}>
+                          {c.customer_name}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                </div>
+
+                {/* Server Grid */}
+                {customerId && (
+                  <div className="mt-6 space-y-4">
+                    <div className="flex items-center justify-between">
+                      <h3 className="text-base font-semibold text-gray-900 flex items-center gap-2">
+                        <span className="text-xl">🖥️</span>
+                        Connected Servers
+                      </h3>
+                      <div className="px-3 py-1 rounded-full bg-green-100 border border-green-300">
+                        <span className="text-xs font-semibold text-green-800">{servers.length} Active</span>
+                      </div>
+                    </div>
+
+                    {servers.length === 0 ? (
+                      <div className="rounded border-2 border-dashed border-gray-300 bg-gray-50 p-12 text-center">
+                        <div className="text-5xl mb-3">📡</div>
+                        <div className="text-sm text-gray-600">No servers detected yet. Upload repository JSON to begin.</div>
+                      </div>
+                    ) : (
+                      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
+                        {servers.map((s) => (
+                          <div
+                            key={s.server_id}
+                            className="rounded border border-gray-200 bg-white hover:border-gray-300 hover:shadow p-4 transition-all"
+                          >
+                            <div className="flex items-start justify-between mb-2">
+                              <div className="h-8 w-8 rounded bg-gray-100 grid place-items-center text-lg">🖥️</div>
+                              <div className="h-2 w-2 rounded-full bg-green-500" />
+                            </div>
+                            <div className="font-semibold text-sm text-gray-900 mb-1">{s.server_name}</div>
+                            <div className="text-xs text-gray-500">
+                              {s.environment ? `Env: ${s.environment}` : "No environment"}
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    )}
                   </div>
                 )}
               </div>
-            )}
-          </div>
 
-          {/* Upload Section */}
-          <div className="space-y-4">
-            <div className="flex items-center gap-3">
-              <span className="text-2xl">📤</span>
-              <h2 className="text-lg font-semibold text-gray-900">Data Pipeline</h2>
-            </div>
-
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-              <RepositoryUploadCard />
-              <UploadCard
-                title="QEM Servers (TSV)"
-                icon="🔗"
-                description="Map ServerName to repository server names"
-                fileRef={qemServersFileRef}
-                accept=".tsv,.csv,.txt"
-                onUpload={handleUploadQemServersTsv}
-                phase={qemServersPhase}
-                pct={qemServersPct}
-              />
-              <UploadCard
-                title="QEM Metrics (TSV)"
-                icon="📊"
-                description="Upload the AEM Tasks export. Required columns (any order): State, Server, Task, Server Type, Source Name, Source Type, Target Name, Target Type."
-                fileRef={qemFileRef}
-                accept=".tsv,.csv,.txt"
-                onUpload={handleUploadQemTsv}
-                phase={qemPhase}
-                pct={qemPct}
-              />
-              <UploadCard
-                title="Replicate Task Log"
-                icon="🔐"
-                description="Any one task log is fine; we'll parse license entitlements from it"
-                fileRef={licenseFileRef}
-                accept=".log,.txt"
-                onUpload={handleUploadLicenseLog}
-                phase={licensePhase}
-                pct={licensePct}
-              />
-              <MetricsLogCard />
-            </div>
-          </div>
-
-          {/* Status Messages */}
-          {(ingestMsg || serversUpsertMsg || qemSummary || licenseSummary || metricsSummary) && (
-            <div className="space-y-4">
-              {ingestMsg && (
-                <div className="rounded border border-green-200 bg-green-50 p-4">
-                  <div className="flex items-center gap-3">
-                    <span className="text-xl">✅</span>
-                    <span className="text-sm font-medium text-gray-900">{ingestMsg}</span>
-                  </div>
+              {/* Upload Section */}
+              <div className="space-y-4">
+                <div className="flex items-center gap-3">
+                  <span className="text-2xl">📤</span>
+                  <h2 className="text-lg font-semibold text-gray-900">Data Pipeline</h2>
                 </div>
-              )}
 
-              {serversUpsertMsg && (
-                <div className="rounded border border-blue-200 bg-blue-50 p-4">
-                  <div className="flex items-center gap-3">
-                    <span className="text-xl">🔗</span>
-                    <span className="text-sm font-medium text-gray-900">{serversUpsertMsg}</span>
-                  </div>
-                </div>
-              )}
-
-              {qemSummary && (
-                <div className="rounded border border-purple-200 bg-white p-6">
-                  <div className="flex items-center gap-3 mb-4">
-                    <span className="text-2xl">📊</span>
-                    <h3 className="text-base font-semibold text-gray-900">QEM Processing Summary</h3>
-                  </div>
-                  <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
-                    <div className="rounded bg-gray-50 border border-gray-200 p-3">
-                      <div className="text-xs font-semibold text-gray-600 uppercase tracking-wide mb-1">Rows</div>
-                      <div className="text-xl font-bold text-gray-900">{qemSummary.rows?.toLocaleString()}</div>
-                    </div>
-                    <div className="rounded bg-gray-50 border border-gray-200 p-3">
-                      <div className="text-xs font-semibold text-gray-600 uppercase tracking-wide mb-1">Inserted</div>
-                      <div className="text-xl font-bold text-gray-900">{qemSummary.inserted?.toLocaleString()}</div>
-                    </div>
-                    <div className="rounded bg-gray-50 border border-gray-200 p-3">
-                      <div className="text-xs font-semibold text-gray-600 uppercase tracking-wide mb-1">Matched</div>
-                      <div className="text-xl font-bold text-gray-900">{qemSummary.matched?.toLocaleString()}</div>
-                    </div>
-                    <div className="rounded bg-gray-50 border border-gray-200 p-3">
-                      <div className="text-xs font-semibold text-gray-600 uppercase tracking-wide mb-1">Mode</div>
-                      <div className="text-lg font-bold text-gray-900">{qemSummary.match_mode}</div>
-                    </div>
-                  </div>
-                </div>
-              )}
-
-              {metricsSummary && (
-                <div className="rounded border border-orange-200 bg-white p-6">
-                  <div className="flex items-center gap-3 mb-4">
-                    <span className="text-2xl">📈</span>
-                    <h3 className="text-base font-semibold text-gray-900">Metrics Log Summary</h3>
-                  </div>
-                  <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
-                    <div className="rounded bg-gray-50 border border-gray-200 p-3">
-                      <div className="text-xs font-semibold text-gray-600 uppercase tracking-wide mb-1">Rows</div>
-                      <div className="text-xl font-bold text-gray-900">{metricsSummary.rows ?? 0}</div>
-                    </div>
-                    <div className="rounded bg-gray-50 border border-gray-200 p-3">
-                      <div className="text-xs font-semibold text-gray-600 uppercase tracking-wide mb-1">Inserted</div>
-                      <div className="text-xl font-bold text-gray-900">{metricsSummary.inserted ?? 0}</div>
-                    </div>
-                    <div className="rounded bg-gray-50 border border-gray-200 p-3">
-                      <div className="text-xs font-semibold text-gray-600 uppercase tracking-wide mb-1">Matched</div>
-                      <div className="text-xl font-bold text-gray-900">{metricsSummary.matched ?? 0}</div>
-                    </div>
-                    <div className="rounded bg-gray-50 border border-gray-200 p-3">
-                      <div className="text-xs font-semibold text-gray-600 uppercase tracking-wide mb-1">
-                        Duplicate UUIDs
-                      </div>
-                      <div className="text-xl font-bold text-gray-900">{metricsSummary.dup_count ?? 0}</div>
-                    </div>
-                  </div>
-                </div>
-              )}
-
-              {licenseSummary && (
-                <div className="rounded border border-pink-200 bg-white p-6">
-                  <div className="flex items-center gap-3 mb-4">
-                    <span className="text-2xl">🔐</span>
-                    <h3 className="text-base font-semibold text-gray-900">License Information</h3>
-                  </div>
-                  <div className="space-y-4">
-                    <div className="grid grid-cols-2 gap-4">
-                      <div className="rounded bg-gray-50 border border-gray-200 p-3">
-                        <div className="text-xs font-semibold text-gray-600 uppercase tracking-wide mb-1">All Sources</div>
-                        <div className="text-xl font-bold text-gray-900">
-                          {licenseSummary.all_sources ? "✓ Yes" : "✗ No"}
-                        </div>
-                      </div>
-                      <div className="rounded bg-gray-50 border border-gray-200 p-3">
-                        <div className="text-xs font-semibold text-gray-600 uppercase tracking-wide mb-1">All Targets</div>
-                        <div className="text-xl font-bold text-gray-900">
-                          {licenseSummary.all_targets ? "✓ Yes" : "✗ No"}
-                        </div>
-                      </div>
-                    </div>
-                    {Array.isArray(licenseSummary.sources) && licenseSummary.sources.length > 0 && (
-                      <div className="rounded bg-gray-50 border border-gray-200 p-4">
-                        <div className="text-xs font-semibold text-gray-600 uppercase tracking-wide mb-2">
-                          Licensed Sources
-                        </div>
-                        <div className="flex flex-wrap gap-2">
-                          {licenseSummary.sources.map((src, i) => (
-                            <span
-                              key={i}
-                              className="px-3 py-1 rounded-full bg-green-100 border border-green-300 text-xs font-medium text-gray-900"
-                            >
-                              {src}
-                            </span>
-                          ))}
-                        </div>
-                      </div>
-                    )}
-                    {Array.isArray(licenseSummary.targets) && licenseSummary.targets.length > 0 && (
-                      <div className="rounded bg-gray-50 border border-gray-200 p-4">
-                        <div className="text-xs font-semibold text-gray-600 uppercase tracking-wide mb-2">
-                          Licensed Targets
-                        </div>
-                        <div className="flex flex-wrap gap-2">
-                          {licenseSummary.targets.map((tgt, i) => (
-                            <span
-                              key={i}
-                              className="px-3 py-1 rounded-full bg-green-100 border border-green-300 text-xs font-medium text-gray-900"
-                            >
-                              {tgt}
-                            </span>
-                          ))}
-                        </div>
-                      </div>
-                    )}
-                  </div>
-                </div>
-              )}
-            </div>
-          )}
-
-          {/* Cleanup Section */}
-          <div className="bg-white border border-red-200 rounded p-6">
-            <div className="flex items-center gap-3 mb-6">
-              <span className="text-2xl">🗑️</span>
-              <h2 className="text-lg font-semibold text-gray-900">Data Cleanup</h2>
-            </div>
-
-            <div className="flex flex-col md:flex-row items-start md:items-center justify-between gap-6">
-              <label className="flex items-center gap-3 text-gray-700 cursor-pointer">
-                <input
-                  type="checkbox"
-                  checked={deleteAlsoServers}
-                  onChange={(e) => setDeleteAlsoServers(e.target.checked)}
-                  className="h-4 w-4 rounded border-gray-300 text-green-600 focus:ring-green-500"
-                />
-                <span className="text-sm font-medium">Also delete server configurations</span>
-              </label>
-
-              <button
-                onClick={handleDeleteAll}
-                disabled={!customerId || busy}
-                className="rounded bg-red-600 hover:bg-red-700 disabled:bg-gray-300 disabled:cursor-not-allowed px-5 h-10 text-sm text-white font-semibold transition-colors"
-              >
-                ⚠️ Delete All Data
-              </button>
-            </div>
-            <div className="text-xs text-gray-500 mt-3">This is irreversible for the selected customer snapshot.</div>
-          </div>
-
-          {/* Action Bar */}
-          <div className="flex flex-col md:flex-row items-center justify-between gap-6 pt-4 border-t border-gray-200">
-            <div className="text-gray-600 text-sm">Inspired by real-world CSE needs</div>
-            <div className="flex items-center gap-3">
-              <div className="flex items-center gap-2">
-                <span className="text-xs text-gray-600">🔐 License Usage</span>
-                <button
-                  type="button"
-                  onClick={requestToggleIncludeLicense}
-                  title="Include or exclude the License Usage section in the report"
-                  className={`relative inline-flex h-6 w-10 items-center rounded-full transition-colors ${
-                    includeLicense ? "bg-green-600" : "bg-gray-300"
-                  }`}
-                >
-                  <span
-                    className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${
-                      includeLicense ? "translate-x-5" : "translate-x-1"
-                    }`}
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                  <RepositoryUploadCard />
+                  <UploadCard
+                    title="QEM Servers (TSV)"
+                    icon="🔗"
+                    description="Map ServerName to repository server names"
+                    fileRef={qemServersFileRef}
+                    accept=".tsv,.csv,.txt"
+                    onUpload={handleUploadQemServersTsv}
+                    phase={qemServersPhase}
+                    pct={qemServersPct}
                   />
-                </button>
+                  <UploadCard
+                    title="QEM Metrics (TSV)"
+                    icon="📊"
+                    description="Upload quality & performance metrics"
+                    fileRef={qemFileRef}
+                    accept=".tsv,.csv,.txt"
+                    onUpload={handleUploadQemTsv}
+                    phase={qemPhase}
+                    pct={qemPct}
+                  />
+                  {/* RENAMED TILE */}
+                  <UploadCard
+                    title="Replicate Task Log"
+                    icon="🔐"
+                    description="Any one task log is fine; we'll parse license entitlements from it"
+                    fileRef={licenseFileRef}
+                    accept=".log,.txt"
+                    onUpload={handleUploadLicenseLog}
+                    phase={licensePhase}
+                    pct={licensePct}
+                  />
+                  <MetricsLogCard />
+                </div>
               </div>
-              {includeLicense && (
-                <span className="inline-flex items-center gap-1 rounded-full border px-2.5 h-9 text-xs font-medium bg-amber-50 border-amber-300 text-amber-900">
-                  ⚠️ Includes license info
-                </span>
+
+              {/* Status Messages */}
+              {(ingestMsg || serversUpsertMsg || qemSummary || licenseSummary || metricsSummary) && (
+                <div className="space-y-4">
+                  {ingestMsg && (
+                    <div className="rounded border border-green-200 bg-green-50 p-4">
+                      <div className="flex items-center gap-3">
+                        <span className="text-xl">✅</span>
+                        <span className="text-sm font-medium text-gray-900">{ingestMsg}</span>
+                      </div>
+                    </div>
+                  )}
+
+                  {serversUpsertMsg && (
+                    <div className="rounded border border-blue-200 bg-blue-50 p-4">
+                      <div className="flex items-center gap-3">
+                        <span className="text-xl">🔗</span>
+                        <span className="text-sm font-medium text-gray-900">{serversUpsertMsg}</span>
+                      </div>
+                    </div>
+                  )}
+
+                  {qemSummary && (
+                    <div className="rounded border border-purple-200 bg-white p-6">
+                      <div className="flex items-center gap-3 mb-4">
+                        <span className="text-2xl">📊</span>
+                        <h3 className="text-base font-semibold text-gray-900">QEM Processing Summary</h3>
+                      </div>
+                      <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+                        <div className="rounded bg-gray-50 border border-gray-200 p-3">
+                          <div className="text-xs font-semibold text-gray-600 uppercase tracking-wide mb-1">Rows</div>
+                          <div className="text-xl font-bold text-gray-900">{qemSummary.rows?.toLocaleString()}</div>
+                        </div>
+                        <div className="rounded bg-gray-50 border border-gray-200 p-3">
+                          <div className="text-xs font-semibold text-gray-600 uppercase tracking-wide mb-1">Inserted</div>
+                          <div className="text-xl font-bold text-gray-900">{qemSummary.inserted?.toLocaleString()}</div>
+                        </div>
+                        <div className="rounded bg-gray-50 border border-gray-200 p-3">
+                          <div className="text-xs font-semibold text-gray-600 uppercase tracking-wide mb-1">Matched</div>
+                          <div className="text-xl font-bold text-gray-900">{qemSummary.matched?.toLocaleString()}</div>
+                        </div>
+                        <div className="rounded bg-gray-50 border border-gray-200 p-3">
+                          <div className="text-xs font-semibold text-gray-600 uppercase tracking-wide mb-1">Mode</div>
+                          <div className="text-lg font-bold text-gray-900">{qemSummary.match_mode}</div>
+                        </div>
+                      </div>
+                    </div>
+                  )}
+
+                  {metricsSummary && (
+                    <div className="rounded border border-orange-200 bg-white p-6">
+                      <div className="flex items-center gap-3 mb-4">
+                        <span className="text-2xl">📈</span>
+                        <h3 className="text-base font-semibold text-gray-900">Metrics Log Summary</h3>
+                      </div>
+                      <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+                        <div className="rounded bg-gray-50 border border-gray-200 p-3">
+                          <div className="text-xs font-semibold text-gray-600 uppercase tracking-wide mb-1">Rows</div>
+                          <div className="text-xl font-bold text-gray-900">{metricsSummary.rows ?? 0}</div>
+                        </div>
+                        <div className="rounded bg-gray-50 border border-gray-200 p-3">
+                          <div className="text-xs font-semibold text-gray-600 uppercase tracking-wide mb-1">Inserted</div>
+                          <div className="text-xl font-bold text-gray-900">{metricsSummary.inserted ?? 0}</div>
+                        </div>
+                        <div className="rounded bg-gray-50 border border-gray-200 p-3">
+                          <div className="text-xs font-semibold text-gray-600 uppercase tracking-wide mb-1">Matched</div>
+                          <div className="text-xl font-bold text-gray-900">{metricsSummary.matched ?? 0}</div>
+                        </div>
+                        <div className="rounded bg-gray-50 border border-gray-200 p-3">
+                          <div className="text-xs font-semibold text-gray-600 uppercase tracking-wide mb-1">
+                            Duplicate UUIDs
+                          </div>
+                          <div className="text-xl font-bold text-gray-900">{metricsSummary.dup_count ?? 0}</div>
+                        </div>
+                      </div>
+                    </div>
+                  )}
+
+                  {licenseSummary && (
+                    <div className="rounded border border-pink-200 bg-white p-6">
+                      <div className="flex items-center gap-3 mb-4">
+                        <span className="text-2xl">🔐</span>
+                        <h3 className="text-base font-semibold text-gray-900">License Information</h3>
+                      </div>
+                      <div className="space-y-4">
+                        <div className="grid grid-cols-2 gap-4">
+                          <div className="rounded bg-gray-50 border border-gray-200 p-3">
+                            <div className="text-xs font-semibold text-gray-600 uppercase tracking-wide mb-1">All Sources</div>
+                            <div className="text-xl font-bold text-gray-900">
+                              {licenseSummary.all_sources ? "✓ Yes" : "✗ No"}
+                            </div>
+                          </div>
+                          <div className="rounded bg-gray-50 border border-gray-200 p-3">
+                            <div className="text-xs font-semibold text-gray-600 uppercase tracking-wide mb-1">All Targets</div>
+                            <div className="text-xl font-bold text-gray-900">
+                              {licenseSummary.all_targets ? "✓ Yes" : "✗ No"}
+                            </div>
+                          </div>
+                        </div>
+                        {Array.isArray(licenseSummary.sources) && licenseSummary.sources.length > 0 && (
+                          <div className="rounded bg-gray-50 border border-gray-200 p-4">
+                            <div className="text-xs font-semibold text-gray-600 uppercase tracking-wide mb-2">
+                              Licensed Sources
+                            </div>
+                            <div className="flex flex-wrap gap-2">
+                              {licenseSummary.sources.map((src, i) => (
+                                <span
+                                  key={i}
+                                  className="px-3 py-1 rounded-full bg-green-100 border border-green-300 text-xs font-medium text-gray-900"
+                                >
+                                  {src}
+                                </span>
+                              ))}
+                            </div>
+                          </div>
+                        )}
+                        {Array.isArray(licenseSummary.targets) && licenseSummary.targets.length > 0 && (
+                          <div className="rounded bg-gray-50 border border-gray-200 p-4">
+                            <div className="text-xs font-semibold text-gray-600 uppercase tracking-wide mb-2">
+                              Licensed Targets
+                            </div>
+                            <div className="flex flex-wrap gap-2">
+                              {licenseSummary.targets.map((tgt, i) => (
+                                <span
+                                  key={i}
+                                  className="px-3 py-1 rounded-full bg-green-100 border border-green-300 text-xs font-medium text-gray-900"
+                                >
+                                  {tgt}
+                                </span>
+                              ))}
+                            </div>
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  )}
+                </div>
               )}
-              <button
-                onClick={() => setHelpOpen(true)}
-                className="rounded border border-gray-300 bg-white hover:bg-gray-50 px-4 h-9 text-sm text-gray-700 font-medium transition-colors"
-              >
-                💡 Quick Guide
-              </button>
-              <button
-                onClick={downloadCustomerDocx}
-                disabled={!customerName || exporting}
-                className="rounded bg-green-600 hover:bg-green-700 disabled:bg-gray-300 disabled:cursor-not-allowed px-5 h-9 text-sm text-white font-semibold transition-colors"
-              >
-                {exporting ? "⏳ Generating…" : "📥 Generate Report"}
-              </button>
-            </div>
-          </div>
-        </div>
-      </div>
 
-      {/* Sticky modal: QEM required columns */}
-      {qemHeaderDialog.open && (
-        <div className="fixed inset-0 z-[100] flex items-center justify-center bg-black/40">
-          <div className="w-full max-w-xl rounded-2xl bg-white p-6 shadow-2xl">
-            <div className="mb-4 flex items-start justify-between">
-              <div>
-                <h3 className="text-lg font-semibold">QEM Tasks file needs required columns</h3>
-                <p className="mt-1 text-sm text-slate-600">
-                  The uploaded TSV is missing required column(s). These columns can appear in any order, but must exist in the header row.
-                  Export the AEM “Tasks” view with full columns and try again.
-                </p>
+              {/* Cleanup Section */}
+              <div className="bg-white border border-red-200 rounded p-6">
+                <div className="flex items-center gap-3 mb-6">
+                  <span className="text-2xl">🗑️</span>
+                  <h2 className="text-lg font-semibold text-gray-900">Data Cleanup</h2>
+                </div>
+
+                <div className="flex flex-col md:flex-row items-start md:items-center justify-between gap-6">
+                  <label className="flex items-center gap-3 text-gray-700 cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={deleteAlsoServers}
+                      onChange={(e) => setDeleteAlsoServers(e.target.checked)}
+                      className="h-4 w-4 rounded border-gray-300 text-green-600 focus:ring-green-500"
+                    />
+                    <span className="text-sm font-medium">Also delete server configurations</span>
+                  </label>
+
+                  <button
+                    onClick={handleDeleteAll}
+                    disabled={!customerId || busy}
+                    className="rounded bg-red-600 hover:bg-red-700 disabled:bg-gray-300 disabled:cursor-not-allowed px-5 h-10 text-sm text-white font-semibold transition-colors"
+                  >
+                    ⚠️ Delete All Data
+                  </button>
+                </div>
+                <div className="text-xs text-gray-500 mt-3">This is irreversible for the selected customer snapshot.</div>
               </div>
-              <button
-                onClick={() => setQemHeaderDialog({ open: false, missing: [], headers: [] })}
-                className="ml-4 rounded-full p-2 text-slate-500 hover:bg-slate-100"
-                aria-label="Close"
-                title="Close"
-              >
-                ✕
-              </button>
-            </div>
 
-            <div className="rounded-lg border border-amber-300 bg-amber-50 p-3">
-              <div className="mb-2 text-sm font-medium text-amber-900">Missing columns</div>
-              <ul className="list-inside list-disc text-sm text-amber-900">
-                {qemHeaderDialog.missing.map((m) => (
-                  <li key={m}>{m}</li>
-                ))}
-              </ul>
-            </div>
-
-            <div className="mt-5 flex gap-2">
-              <button
-                onClick={() => { const list = REQUIRED_QEM_HEADERS.join('\n'); navigator.clipboard.writeText(list); }}
-                className="rounded-lg bg-slate-900 px-3 py-2 text-sm text-white hover:bg-slate-800"
-              >
-                Copy required columns
-              </button>
-              <button
-                onClick={() => setQemHeaderDialog({ open: false, missing: [], headers: [] })}
-                className="ml-auto rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-700 hover:bg-slate-50"
-              >
-                Got it
-              </button>
+              {/* Action Bar */}
+              <div className="flex flex-col md:flex-row items-center justify-between gap-6 pt-4 border-t border-gray-200">
+                <div className="text-gray-600 text-sm">Inspired by real-world CSE needs</div>
+                <div className="flex items-center gap-3">
+                  {/* Duplicate the toggle here so it’s near the Generate button too */}
+                  <div className="flex items-center gap-2">
+                    <span className="text-xs text-gray-600">🔐 License Usage</span>
+                    <button
+                      type="button"
+                      onClick={requestToggleIncludeLicense}
+                      title="Include or exclude the License Usage section in the report"
+                      className={`relative inline-flex h-6 w-10 items-center rounded-full transition-colors ${
+                        includeLicense ? "bg-green-600" : "bg-gray-300"
+                      }`}
+                    >
+                      <span
+                        className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${
+                          includeLicense ? "translate-x-5" : "translate-x-1"
+                        }`}
+                      />
+                    </button>
+                  </div>
+                  {includeLicense && (
+                    <span className="inline-flex items-center gap-1 rounded-full border px-2.5 h-9 text-xs font-medium bg-amber-50 border-amber-300 text-amber-900">
+                      ⚠️ Includes license info
+                    </span>
+                  )}
+                  <button
+                    onClick={() => setHelpOpen(true)}
+                    className="rounded border border-gray-300 bg-white hover:bg-gray-50 px-4 h-9 text-sm text-gray-700 font-medium transition-colors"
+                  >
+                    💡 Quick Guide
+                  </button>
+                  <button
+                    onClick={downloadCustomerDocx}
+                    disabled={!customerName || exporting}
+                    className="rounded bg-green-600 hover:bg-green-700 disabled:bg-gray-300 disabled:cursor-not-allowed px-5 h-9 text-sm text-white font-semibold transition-colors"
+                  >
+                    {exporting ? "⏳ Generating…" : "📥 Generate Report"}
+                  </button>
+                </div>
+              </div>
             </div>
           </div>
-        </div>
+        </main>
       )}
 
-      {/* Sensitive data nudge */}
+      {activeTab === "qliksense" && (
+        <main className="mx-auto max-w-[1400px] px-6 py-8">
+          <QlikSenseTab />
+        </main>
+      )}
+
+      {/* License inclusion nudge modal (centered + animated) */}
       {showLicenseNudge && (
         <div className="fixed inset-0 z-[70] flex items-center justify-center p-4">
           <div className="absolute inset-0 bg-black/50" onClick={() => setShowLicenseNudge(false)} />
@@ -1808,6 +1810,83 @@ function ReplicateTab() {
         </div>
       )}
 
+      {/* Help Drawer */}
+      {helpOpen && (
+        <div className="fixed inset-0 z-50">
+          <div className="absolute inset-0 bg-black/40" onClick={() => setHelpOpen(false)} />
+          <aside className="absolute right-0 top-0 h-full w-[600px] max-w-[95vw] bg-white shadow-2xl overflow-y-auto">
+            <div className="flex items-center justify-between border-b border-gray-200 px-6 py-5 bg-gray-50 sticky top-0">
+              <div className="flex items-center gap-3">
+                <span className="text-2xl">💡</span>
+                <h2 className="text-lg font-semibold text-gray-900">Quick Start Guide</h2>
+              </div>
+              <button
+                onClick={() => setHelpOpen(false)}
+                className="h-8 w-8 rounded hover:bg-gray-200 transition-colors grid place-items-center"
+              >
+                <span className="text-gray-600 text-xl">✕</span>
+              </button>
+            </div>
+
+            <div className="p-6 space-y-4">
+              <div className="space-y-3">
+                {[
+                  { num: 1, title: "Create Customer", desc: "Start by adding a new customer or selecting an existing one from the dropdown.", icon: "🏢" },
+                  { num: 2, title: "Upload Repository", desc: "Upload a single JSON or a ZIP of JSONs. We auto-detect servers and stream per-file status.", icon: "📋" },
+                  { num: 3, title: "Map QEM Servers", desc: "If your QEM data lacks Host information, upload the Servers TSV to create mappings.", icon: "🔗" },
+                  { num: 4, title: "Import Metrics", desc: "Upload the QEM Metrics TSV file to process quality and performance data.", icon: "📊" },
+                  { num: 5, title: "Upload Metrics Log", desc: "Optional: ingest per-server Metrics Log to capture rows/bytes by task UUID.", icon: "📈" },
+                  { num: 6, title: "Replicate Task Log", desc: "Upload any one task log; we’ll parse license entitlements from it.", icon: "🔐" },
+                  { num: 7, title: "Generate Report", desc: "Click 'Generate Report' to create a polished Word document with all insights.", icon: "📥" },
+                ].map((step) => (
+                  <div key={step.num} className="border border-gray-200 rounded p-4 hover:border-gray-300 hover:shadow transition-all">
+                    <div className="flex gap-4">
+                      <div className="shrink-0">
+                        <div className="h-10 w-10 rounded bg-gray-100 grid place-items-center text-xl">{step.icon}</div>
+                      </div>
+                      <div className="flex-1">
+                        <div className="flex items-center gap-2 mb-2">
+                          <div className="h-5 w-5 rounded-full bg-green-600 grid place-items-center text-xs font-semibold text-white">
+                            {step.num}
+                          </div>
+                          <h3 className="text-sm font-semibold text-gray-900">{step.title}</h3>
+                        </div>
+                        <p className="text-sm text-gray-600">{step.desc}</p>
+                      </div>
+                    </div>
+                  </div>
+                ))}
+              </div>
+
+              <div className="rounded border border-green-200 bg-green-50 p-5">
+                <div className="flex items-center gap-3 mb-3">
+                  <span className="text-xl">💡</span>
+                  <h3 className="text-sm font-semibold text-gray-900">Pro Tips</h3>
+                </div>
+                <ul className="space-y-2 text-sm text-gray-700">
+                  <li className="flex items-start gap-2">
+                    <span className="text-green-600 mt-0.5">▸</span>
+                    <span>Upload Repository JSON first (or ZIP) to establish the server baseline</span>
+                  </li>
+                  <li className="flex items-start gap-2">
+                    <span className="text-green-600 mt-0.5">▸</span>
+                    <span>Use drag-and-drop for faster file uploads</span>
+                  </li>
+                  <li className="flex items-start gap-2">
+                    <span className="text-green-600 mt-0.5">▸</span>
+                    <span>Watch the timeline to see per-server ingest status in real time</span>
+                  </li>
+                  <li className="flex items-start gap-2">
+                    <span className="text-green-600 mt-0.5">▸</span>
+                    <span>Export reports anytime after uploading core data</span>
+                  </li>
+                </ul>
+              </div>
+            </div>
+          </aside>
+        </div>
+      )}
+
       {/* Export & Delete overlays */}
       <LoaderOverlay
         show={exporting}
@@ -1821,118 +1900,6 @@ function ReplicateTab() {
         icon="🧹"
       />
 
-      {/* Local animations */}
-      <style>{`
-        @keyframes progress-move { 
-          0% { transform: translateX(-100%);} 
-          100% { transform: translateX(100%);} 
-        }
-        .animate-progress-bar { 
-          animation: progress-move 1.2s linear infinite; 
-        }
-        @keyframes modal-in {
-          0% { opacity: 0; transform: scale(.96); }
-          100% { opacity: 1; transform: scale(1); }
-        }
-        .animate-modal-in {
-          animation: modal-in .14s ease-out;
-        }
-      `}</style>
-    </div>
-  );
-}
-
-/* =========================
-   TOP-LEVEL APP W/ TABS
-   ========================= */
-export default function App() {
-  const [active, setActive] = useState<"replicate" | "qliksense">(() => {
-    const url = new URL(window.location.href);
-    const q = (url.searchParams.get("tab") || "").toLowerCase();
-    const stored = (localStorage.getItem(LS_ACTIVE_TAB) || "").toLowerCase();
-    if (q === "qliksense" || q === "replicate") return q as any;
-    if (stored === "qliksense" || stored === "replicate") return stored as any;
-    return "replicate";
-  });
-
-  // Persist + update URL param for deep-linking
-  useEffect(() => {
-    try {
-      localStorage.setItem(LS_ACTIVE_TAB, active);
-    } catch {}
-    const url = new URL(window.location.href);
-    url.searchParams.set("tab", active);
-    window.history.replaceState({}, "", url.toString());
-  }, [active]);
-
-  const tabs: Array<{ id: "replicate" | "qliksense"; label: string; emoji: string }> = [
-    { id: "replicate", label: "Replicate", emoji: "🔁" },
-    { id: "qliksense", label: "Qlik Sense", emoji: "🧠" },
-  ];
-
-  function onKeyDown(e: React.KeyboardEvent<HTMLDivElement>) {
-    const order = ["replicate", "qliksense"] as const;
-    const idx = order.indexOf(active);
-    if (e.key === "ArrowRight") {
-      setActive(order[(idx + 1) % order.length]);
-    } else if (e.key === "ArrowLeft") {
-      setActive(order[(idx - 1 + order.length) % order.length]);
-    }
-  }
-
-  return (
-    <div className="min-h-screen bg-gray-50">
-      {/* Global Header + Tabs */}
-      <header className="bg-white border-b border-gray-200 sticky top-0 z-40 shadow-sm">
-        <div className="mx-auto max-w-[1400px] px-6 py-4">
-          <div className="flex items-center justify-between gap-6">
-            {/* Brand */}
-            <div className="flex items-center gap-3">
-              <svg className="h-8 w-8" viewBox="0 0 32 32" fill="none" aria-hidden="true">
-                <rect width="32" height="32" rx="4" fill="#009845" />
-                <path d="M16 8L8 12v8l8 4 8-4v-8l-8-4zm0 2.5l5.5 2.75v5.5L16 21.5l-5.5-2.75v-5.5L16 10.5z" fill="white" />
-              </svg>
-              <div>
-                <div className="text-xl font-semibold text-gray-900">RepMeta Console</div>
-                <div className="text-xs text-gray-600">Unified ingest & insights</div>
-              </div>
-            </div>
-
-            {/* Tab Switcher */}
-            <div
-              role="tablist"
-              aria-label="Choose module"
-              className="rounded-full border border-gray-200 bg-gray-100 p-1 flex items-center gap-1"
-              onKeyDown={onKeyDown}
-            >
-              {tabs.map((t) => {
-                const on = active === t.id;
-                return (
-                  <button
-                    key={t.id}
-                    role="tab"
-                    aria-selected={on}
-                    className={`h-9 px-4 rounded-full text-sm font-medium transition-all focus:outline-none focus-visible:ring-2 focus-visible:ring-green-600 ${
-                      on
-                        ? "bg-white shadow text-gray-900 border border-gray-200"
-                        : "text-gray-700 hover:text-gray-900"
-                    }`}
-                    onClick={() => setActive(t.id)}
-                  >
-                    <span className="mr-1">{t.emoji}</span>
-                    {t.label}
-                  </button>
-                );
-              })}
-            </div>
-          </div>
-        </div>
-      </header>
-
-      {/* Body renders active tab */}
-      {active === "replicate" ? <ReplicateTab /> : <QlikSenseTab />}
-
-      {/* Small global styles for animations used by both tabs */}
       <style>{`
         @keyframes progress-move { 
           0% { transform: translateX(-100%);} 

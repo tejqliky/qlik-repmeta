@@ -9,10 +9,13 @@ import zipfile
 from pathlib import Path
 from typing import Any, Dict, Optional, Callable, Awaitable, List, Tuple
 
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Query, BackgroundTasks
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Query, BackgroundTasks, Body, APIRouter
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, JSONResponse
 from pydantic import BaseModel
+
+# NEW: Qlik Sense routes (mounted at root; see app.include_router below)
+from .routes_qliksense import router as qliksense_router
 
 from psycopg.rows import dict_row  # noqa: F401  (kept for compatibility)
 
@@ -43,13 +46,14 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 log = logging.getLogger("INGEST")
 
 API_TITLE = "Qlik RepMeta API"
-API_VERSION = os.getenv("API_VERSION", "2.5")  # bumped
+API_VERSION = os.getenv("API_VERSION", "2.6")  # bumped
 
 app = FastAPI(title=API_TITLE, version=API_VERSION)
 
 # Register sub-routers
 app.include_router(license_router)
-
+# IMPORTANT: expose Qlik Sense routes at ROOT (no '/api' prefix) for the new UI
+app.include_router(qliksense_router)
 
 # ---------------- CORS (VM-friendly & env-driven) ----------------
 def _parse_csv_env(name: str) -> list[str]:
@@ -114,10 +118,6 @@ class IngestBody(BaseModel):
     server_name: Optional[str] = None
 
 
-class CustomerBody(BaseModel):
-    customer_name: str
-
-
 # ---------------- Helpers ----------------
 def _infer_server_from_description_text(raw_text: str) -> Optional[str]:
     """
@@ -131,7 +131,7 @@ def _infer_server_from_description_text(raw_text: str) -> Optional[str]:
     return matches[-1].strip() if matches else None
 
 
-# ---------- ZIP safety (mirror approach used previously in ingest; kept in API now) ----------
+# ---------- ZIP safety ----------
 MAX_ZIP_FILES = int(os.getenv("REPMETA_MAX_ZIP_FILES", "250"))
 MAX_ZIP_UNCOMPRESSED = int(os.getenv("REPMETA_MAX_ZIP_UNCOMPRESSED", str(1_000_000_000)))  # 1 GB
 ALLOWED_ZIP_EXTS = {".json"}
@@ -185,32 +185,7 @@ async def debug_cors():
 
 
 # ---------------- Tenancy ----------------
-@app.post("/customers")
-async def create_customer(body: CustomerBody):
-    """
-    Creates the customer if it doesn't exist and returns both id and name.
-    """
-    name = body.customer_name.strip()
-    async with connection() as conn:
-        cur = await conn.execute(
-            f"""INSERT INTO {SCHEMA}.dim_customer (customer_name)
-                VALUES (%s) ON CONFLICT (customer_name) DO NOTHING
-                RETURNING customer_id""",
-            (name,),
-        )
-        row = await cur.fetchone()
-        if not row:
-            cur = await conn.execute(
-                f"SELECT customer_id FROM {SCHEMA}.dim_customer WHERE customer_name = %s",
-                (name,),
-            )
-            row = await cur.fetchone()
-
-        # Row can be tuple or dict depending on row factory
-        cid = row[0] if not isinstance(row, dict) else (row.get("customer_id") or row.get("customer_id".upper()))
-        return {"customer_id": cid, "customer_name": name}
-
-
+# List customers (unchanged)
 @app.get("/customers")
 async def list_customers():
     async with connection() as conn:
@@ -220,6 +195,42 @@ async def list_customers():
         rows = await cur.fetchall() or []
         return [{"customer_id": r[0], "customer_name": r[1]} if not isinstance(r, dict) else r for r in rows]
 
+# Helper used by all create routes
+async def _create_or_get_customer(conn, name: str) -> dict:
+    cur = await conn.execute(
+        f"""INSERT INTO {SCHEMA}.dim_customer (customer_name)
+            VALUES (%s) ON CONFLICT (customer_name) DO NOTHING
+            RETURNING customer_id""",
+        (name,),
+    )
+    row = await cur.fetchone()
+    if not row:
+        cur = await conn.execute(
+            f"SELECT customer_id FROM {SCHEMA}.dim_customer WHERE customer_name = %s",
+            (name,),
+        )
+        row = await cur.fetchone()
+
+    cid = row[0] if not isinstance(row, dict) else (row.get("customer_id") or row.get("CUSTOMER_ID"))
+    return {"customer_id": int(cid), "customer_name": name}
+
+# Compatibility router: accepts both payload shapes, on multiple paths.
+customers_router = APIRouter()
+
+@customers_router.post("/customers")
+@customers_router.post("/api/customers")
+@customers_router.post("/qliksense/customers")
+async def create_customer_any(body: dict = Body(...)):
+    """
+    Accepts either {"customer_name": "..."} or {"name": "..."}.
+    """
+    name = (body.get("customer_name") or body.get("name") or "").strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="customer_name is required")
+    async with connection() as conn:
+        return await _create_or_get_customer(conn, name)
+
+app.include_router(customers_router)
 
 @app.get("/customers/{customer_id}/servers")
 async def list_servers(customer_id: int):
@@ -238,6 +249,13 @@ async def list_servers(customer_id: int):
 
 
 # ---------------- Ingest (JSON body) ----------------
+class IngestBody(BaseModel):
+    payload: Dict[str, Any]
+    file_name: Optional[str] = "repository.json"
+    uploaded_by: Optional[str] = None
+    customer_name: Optional[str] = None
+    server_name: Optional[str] = None
+
 @app.post("/ingest")
 async def ingest(body: IngestBody):
     """
@@ -419,7 +437,7 @@ async def _ingest_single_json_bytes(
     try:
         payload = json.loads(text)
     except Exception as je:
-        await _emit(job, {"type": "error", "fileName": filename, "message": f"Invalid JSON: {je}"})
+        await _emit(job, {"type": "error", "FileName": filename, "message": f"Invalid JSON: {je}"})
         return False, None
 
     server = _infer_server_from_description_text(text) or ""

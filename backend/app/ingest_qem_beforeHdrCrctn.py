@@ -1,3 +1,4 @@
+
 import csv
 import io
 import os
@@ -13,18 +14,6 @@ from .db import connection
 
 LOG = logging.getLogger("ingest_qem")
 SCHEMA = os.getenv("REPMETA_SCHEMA", "repmeta")
-
-# --------- required headers (strict) ----------
-CORE_REQUIRED_QEM_HEADERS = [
-    "State",
-    "Server",
-    "Task",
-    "Server Type",
-    "Source Name",
-    "Source Type",
-    "Target Name",
-    "Target Type",
-]
 
 
 # ---------- helpers ----------
@@ -416,21 +405,9 @@ async def ingest_qem_tsv(data_bytes: bytes, customer_name: str, file_name: str) 
     text = _decode_bytes_to_text(data_bytes)
     reader = csv.DictReader(io.StringIO(text), delimiter="\t")
     headers = reader.fieldnames or []
-    # Strict core header enforcement
-    header_set = {h.strip() for h in headers}
-    missing_core = [h for h in CORE_REQUIRED_QEM_HEADERS if h not in header_set]
-    if missing_core:
-        LOG.error("[QEM] TSV missing required headers: %s", ", ".join(missing_core))
-        raise ValueError(
-            "QEM TSV missing required column(s): "
-            + ", ".join(missing_core)
-            + ". Please export the AEM 'Tasks' view with full columns "
-              "(State, Server, Task, Server Type, Source Name, Source Type, Target Name, Target Type) and try again."
-        )
-
     rows = [dict(r) for r in reader]
 
-    # Header sanity (non-fatal) for optional groups
+    # Header sanity (non-fatal)
     missing = []
     for group in EXPECTED_HEADER_GROUPS:
         if not any(h in headers for h in group):

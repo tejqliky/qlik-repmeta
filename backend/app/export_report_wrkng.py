@@ -871,41 +871,13 @@ async def _metrics_monthly_current_year(conn, customer_id: int):
             date_trunc('month', ts)::date AS m,
             customer_id, server_id, task_id, task_uuid,
             ts, load_bytes, cdc_bytes
-          FROM {SCHEMA}.v_metrics_events_clean ev
-          WHERE ev.customer_id = %s
-            AND EXISTS (
-              SELECT 1
-              FROM {SCHEMA}.rep_task rt
-              JOIN {SCHEMA}.ingest_run ir2 ON ir2.run_id = rt.run_id
-              WHERE ir2.customer_id = ev.customer_id
-                AND ir2.server_id  = ev.server_id
-                AND ir2.run_id = (
-                      SELECT MAX(ir3.run_id)
-                      FROM {SCHEMA}.ingest_run ir3
-                      WHERE ir3.customer_id = ev.customer_id AND ir3.server_id = ev.server_id
-                )
-                AND ( (ev.task_id  IS NOT NULL AND rt.task_id  = ev.task_id)
-                   OR (ev.task_uuid IS NOT NULL AND rt.task_uuid = ev.task_uuid) )
-            )
+          FROM {SCHEMA}.v_metrics_events_clean
+          WHERE customer_id = %s
         ),
         bounds AS (
           SELECT date_trunc('month', MAX(ts)) AS max_month
-          FROM {SCHEMA}.v_metrics_events_clean ev
-          WHERE ev.customer_id = %s
-            AND EXISTS (
-              SELECT 1
-              FROM {SCHEMA}.rep_task rt
-              JOIN {SCHEMA}.ingest_run ir2 ON ir2.run_id = rt.run_id
-              WHERE ir2.customer_id = ev.customer_id
-                AND ir2.server_id  = ev.server_id
-                AND ir2.run_id = (
-                      SELECT MAX(ir3.run_id)
-                      FROM {SCHEMA}.ingest_run ir3
-                      WHERE ir3.customer_id = ev.customer_id AND ir3.server_id = ev.server_id
-                )
-                AND ( (ev.task_id  IS NOT NULL AND rt.task_id  = ev.task_id)
-                   OR (ev.task_uuid IS NOT NULL AND rt.task_uuid = ev.task_uuid) )
-            )
+          FROM {SCHEMA}.v_metrics_events_clean
+          WHERE customer_id = %s
         ),
         within6 AS (
           SELECT b.*
@@ -956,22 +928,8 @@ async def _metrics_yearly_last5(conn, customer_id: int):
             date_part('year', ts)::int AS y,
             customer_id, server_id, task_id, task_uuid,
             ts, load_bytes, cdc_bytes
-          FROM {SCHEMA}.v_metrics_events_clean ev
-          WHERE ev.customer_id = %s
-            AND EXISTS (
-              SELECT 1
-              FROM {SCHEMA}.rep_task rt
-              JOIN {SCHEMA}.ingest_run ir2 ON ir2.run_id = rt.run_id
-              WHERE ir2.customer_id = ev.customer_id
-                AND ir2.server_id  = ev.server_id
-                AND ir2.run_id = (
-                      SELECT MAX(ir3.run_id)
-                      FROM {SCHEMA}.ingest_run ir3
-                      WHERE ir3.customer_id = ev.customer_id AND ir3.server_id = ev.server_id
-                )
-                AND ( (ev.task_id  IS NOT NULL AND rt.task_id  = ev.task_id)
-                   OR (ev.task_uuid IS NOT NULL AND rt.task_uuid = ev.task_uuid) )
-            )
+          FROM {SCHEMA}.v_metrics_events_clean
+          WHERE customer_id = %s
             AND date_part('year', ts) >= date_part('year', CURRENT_DATE) - 4
         ),
         latest_per_task_year AS (
@@ -1042,14 +1000,8 @@ async def _metrics_top_tasks(conn, customer_id: int, limit: int = 5):
                  (
                    SELECT rt.task_name
                    FROM {SCHEMA}.rep_task rt
-              JOIN {SCHEMA}.ingest_run ir2 ON ir2.run_id = rt.run_id
-              WHERE ir2.customer_id = j.customer_id
-                AND ir2.server_id  = j.server_id
-                AND ir2.run_id = (
-                      SELECT MAX(ir3.run_id)
-                      FROM {SCHEMA}.ingest_run ir3
-                      WHERE ir3.customer_id = j.customer_id AND ir3.server_id = j.server_id
-                )
+                   JOIN {SCHEMA}.ingest_run ir2 ON ir2.run_id = rt.run_id
+                   WHERE ir2.customer_id = j.customer_id
                      AND ( (j.task_id  IS NOT NULL AND rt.task_id  = j.task_id)
                         OR (j.task_uuid IS NOT NULL AND rt.task_uuid = j.task_uuid) )
                    ORDER BY rt.run_id DESC
@@ -1063,7 +1015,6 @@ async def _metrics_top_tasks(conn, customer_id: int, limit: int = 5):
           server_name,
           load_b, cdc_b, (load_b + cdc_b) AS total_b
         FROM name_resolved
-        WHERE task_name IS NOT NULL
         ORDER BY total_b DESC NULLS LAST
         LIMIT {limit};
     """
@@ -1095,23 +1046,9 @@ async def _metrics_top_endpoints(conn, customer_id: int, role: str, metric: str,
     if metric == "load":
         sql = f"""
             WITH latest AS (
-              SELECT customer_id, server_id, {fam_id_col} AS fam_id, {type_col} AS type_label, load_bytes, task_id, task_uuid
-              FROM {SCHEMA}.v_metrics_task_latest_event v
+              SELECT customer_id, server_id, {fam_id_col} AS fam_id, {type_col} AS type_label, load_bytes
+              FROM {SCHEMA}.v_metrics_task_latest_event
               WHERE customer_id = %s
-                AND EXISTS (
-                  SELECT 1
-                  FROM {SCHEMA}.rep_task rt
-              JOIN {SCHEMA}.ingest_run ir2 ON ir2.run_id = rt.run_id
-              WHERE ir2.customer_id = v.customer_id
-                AND ir2.server_id  = v.server_id
-                AND ir2.run_id = (
-                      SELECT MAX(ir3.run_id)
-                      FROM {SCHEMA}.ingest_run ir3
-                      WHERE ir3.customer_id = v.customer_id AND ir3.server_id = v.server_id
-                )
-                    AND ( (v.task_id  IS NOT NULL AND rt.task_id  = v.task_id)
-                       OR (v.task_uuid IS NOT NULL AND rt.task_uuid = v.task_uuid) )
-                )
             )
             SELECT COALESCE(f.family_name, l.type_label) AS endpoint_label,
                    SUM(l.load_bytes)::bigint AS vol_bytes
@@ -1711,358 +1648,14 @@ async def generate_summary_docx(customer_name: str, server_name: str) -> Tuple[b
 # ============================================================
 # Customer Technical Overview
 # ============================================================
+
 async def _endpoint_mix_from_repo(conn, customer_id: int):
+    """Compute Endpoint Mix using the SQL that correctly identifies Log Stream sources.
+    Returns (source_mix, target_mix) as lists of {"type": str, "uses": int}.
     """
-    Endpoint Mix using latest repo per server with:
-      * Table-driven canonicalization via {SCHEMA}.endpoint_family_map (regex, role-aware, priority)
-      * Log Stream detection (source) via `logstreamstagingtask` in settings_json
-      * DB2 family override by table-of-origin (z/OS, iSeries) even if db_settings_type says otherwise
-      * SAFE: dynamically includes only per-endpoint tables that exist (and have settings_json) to avoid query failures
-
-    Returns (source_mix, target_mix) => list of dicts {type, uses}
-    """
-    import os, logging
-    DBG = os.getenv("REPMETA_DEBUG_LOGSTREAM") in ("1","true","TRUE","yes")
+    import logging, os
+    DBG = os.getenv("REPMETA_DEBUG_LOGSTREAM") in ("1", "true", "TRUE", "yes")
     log = logging.getLogger(__name__ + ".endpoint_mix_repo")
-
-    def dbg(msg, *args):
-        if DBG:
-            try:
-                log.info("[LMIX] " + str(msg), *args)
-            except Exception:
-                pass
-
-    dbg("START customer_id=%s", customer_id)
-
-    # Discover which per-endpoint tables exist in this deployment (and settings_json presence for sources).
-    try:
-        # Source endpoint tables we know how to scan for Log Stream
-        src_table_candidates = [
-            "rep_db_sqlserver_source",
-            "rep_db_mysql_source",
-            "rep_db_oracle_source",
-            "rep_db_db2_luw_source",
-            "rep_db_db2_zos_source",
-            "rep_db_db2_iseries_source",
-            "rep_db_postgresql_source",
-            "rep_db_file_source",
-            "rep_db_odbc_source",
-            "rep_db_teradata_source",
-            "rep_db_vsam_source",
-            "rep_db_ims_source",
-        ]
-        # Target tables used only for DB2 family overrides
-        forced_candidates = [
-            ("rep_db_db2_zos_source",    "IBM DB2 for z/OS"),
-            ("rep_db_db2_zos_target",    "IBM DB2 for z/OS"),
-            ("rep_db_db2_iseries_source","IBM DB2 for iSeries"),
-            ("rep_db_db2_iseries_target","IBM DB2 for iSeries"),
-        ]
-
-        # Which tables exist?
-        q_exist = "SELECT table_name FROM information_schema.tables WHERE table_schema=%s AND table_name = ANY(%s)"
-        exist_rows = await _all(conn, q_exist, (SCHEMA, src_table_candidates + [t for t,_ in forced_candidates])) or []
-        existing = {r["table_name"] for r in exist_rows}
-
-        # Of the existing source tables, which have settings_json column?
-        src_existing = [t for t in src_table_candidates if t in existing]
-        q_cols = "SELECT table_name FROM information_schema.columns WHERE table_schema=%s AND column_name='settings_json' AND table_name = ANY(%s)"
-        col_rows = await _all(conn, q_cols, (SCHEMA, src_existing)) or []
-        has_settings = {r["table_name"] for r in col_rows}
-
-        # Build flagged_logstream UNIONs only for tables that exist and have settings_json
-        flagged_parts = []
-        for t in src_existing:
-            if t in has_settings:
-                flagged_parts.append(f"SELECT s.endpoint_id FROM {SCHEMA}.{t} s JOIN src_e USING(endpoint_id) WHERE CAST(s.settings_json AS text) ILIKE '%%logstreamstagingtask%%'")
-        flagged_union = "\n      UNION ALL ".join(flagged_parts)
-
-        # Build forced_family UNIONs only for existing tables
-        forced_parts = []
-        for t, fam in forced_candidates:
-            if t in existing:
-                side = "src_e" if t.endswith("_source") else "tgt_e"
-                forced_parts.append(f"SELECT endpoint_id, '{fam}' AS family FROM {SCHEMA}.{t} WHERE endpoint_id IN (SELECT endpoint_id FROM {side})")
-        forced_union = "\n      UNION ALL ".join(forced_parts)
-
-    except Exception as e:
-        try:
-            log.warning("endpoint mix preflight failed, will proceed without dynamic filtering: %s", e)
-        except Exception:
-            pass
-        flagged_union = ""
-        forced_union = ""
-
-    # Primary SQL: use the unions we constructed above; if none, define empty CTEs that return zero rows
-    sql = f"""
-    WITH latest AS (
-      SELECT server_id, MAX(run_id) AS run_id
-      FROM {SCHEMA}.ingest_run
-      WHERE customer_id = %s
-      GROUP BY server_id
-    ),
-    repo AS (
-      SELECT d.endpoint_id,
-             UPPER(d.role) AS role,
-             COALESCE(d.db_settings_type,'(unknown)') AS db_settings_type
-      FROM {SCHEMA}.rep_database d
-      JOIN latest l ON l.run_id = d.run_id
-    ),
-    src_e AS (SELECT endpoint_id FROM repo WHERE role='SOURCE'),
-    tgt_e AS (SELECT endpoint_id FROM repo WHERE role='TARGET'),
-
-    /* Source-only: detect Log Stream via per-endpoint *source* tables WITH settings_json */
-    flagged_logstream AS (
-      {flagged_union if flagged_union else "SELECT r.endpoint_id FROM repo r WHERE 1=0"}
-    ),
-
-    /* Hard overrides by table-of-origin for DB2 variants on both roles */
-    forced_family AS (
-      {forced_union if forced_union else "SELECT r.endpoint_id, NULL::text AS family FROM repo r WHERE 1=0"}
-    ),
-
-    repo2 AS (
-      SELECT r.endpoint_id, r.role,
-             CASE
-               WHEN r.role='SOURCE' AND EXISTS (SELECT 1 FROM flagged_logstream f WHERE f.endpoint_id=r.endpoint_id)
-                 THEN 'Log Stream'
-               WHEN EXISTS (SELECT 1 FROM forced_family ff WHERE ff.endpoint_id=r.endpoint_id)
-                 THEN (SELECT ff.family FROM forced_family ff WHERE ff.endpoint_id=r.endpoint_id LIMIT 1)
-               ELSE r.db_settings_type
-             END AS raw_type
-      FROM repo r
-    ),
-
-    /* Role-aware regex mapping to canonical family via endpoint_family_map */
-    src_mix AS (
-      SELECT COALESCE(m.family, r.raw_type) AS type, COUNT(*) AS uses
-      FROM repo2 r
-      LEFT JOIN LATERAL (
-        SELECT m.family
-        FROM {SCHEMA}.endpoint_family_map m
-        WHERE m.active
-          AND (m.role IS NULL OR UPPER(m.role) = r.role)
-          AND r.raw_type ~* m.pattern
-        ORDER BY m.priority ASC, length(m.pattern) DESC
-        LIMIT 1
-      ) m ON TRUE
-      WHERE r.role = 'SOURCE'
-      GROUP BY 1
-    ),
-    tgt_mix AS (
-      SELECT COALESCE(m.family, r.raw_type) AS type, COUNT(*) AS uses
-      FROM repo2 r
-      LEFT JOIN LATERAL (
-        SELECT m.family
-        FROM {SCHEMA}.endpoint_family_map m
-        WHERE m.active
-          AND (m.role IS NULL OR UPPER(m.role) = r.role)
-          AND r.raw_type ~* m.pattern
-        ORDER BY m.priority ASC, length(m.pattern) DESC
-        LIMIT 1
-      ) m ON TRUE
-      WHERE r.role = 'TARGET'
-      GROUP BY 1
-    )
-    SELECT 'SOURCE' AS side, type, uses FROM src_mix
-    UNION ALL
-    SELECT 'TARGET' AS side, type, uses FROM tgt_mix
-    ORDER BY side, uses DESC, type;
-    """
-
-    try:
-        rows = await _all(conn, sql, (customer_id,)) or []
-        dbg("Query rows=%s", len(rows))
-    except Exception as e:
-        # Fallback if the primary path fails for any reason.
-        try:
-            log.warning("endpoint mix primary query failed, fallback path: %s", e)
-        except Exception:
-            pass
-        sql_fb = f"""
-        WITH latest AS (
-          SELECT server_id, MAX(run_id) AS run_id
-          FROM {SCHEMA}.ingest_run
-          WHERE customer_id = %s
-          GROUP BY server_id
-        ),
-        repo AS (
-          SELECT UPPER(d.role) AS side,
-                 COALESCE(d.db_settings_type,'(unknown)') AS type
-          FROM {SCHEMA}.rep_database d
-          JOIN latest l ON l.run_id = d.run_id
-        )
-        SELECT side, type, COUNT(*) AS uses
-        FROM repo
-        GROUP BY side, type
-        ORDER BY side, uses DESC, type;
-        """
-        rows = await _all(conn, sql_fb, (customer_id,)) or []
-
-    source_mix, target_mix = [], []
-    for r in rows:
-        side = (r.get("side") or "").upper()
-        typ  = (r.get("type") or "Unknown").strip()
-        uses = int(r.get("uses") or 0)
-        if side == "SOURCE":
-            source_mix.append({"type": "Log Stream" if typ == "Log Stream" else typ, "uses": uses})
-        else:
-            target_mix.append({"type": typ, "uses": uses})
-
-    source_mix.sort(key=lambda x: (-x["uses"], x["type"]))
-    target_mix.sort(key=lambda x: (-x["uses"], x["type"]))
-    dbg("FINAL src=%s tgt=%s", source_mix, target_mix)
-    return source_mix, target_mix
-
-
-
-    def dbg(msg, *args):
-        if DBG:
-            try:
-                log.info("[LMIX] " + str(msg), *args)
-            except Exception:
-                pass
-
-    dbg("START customer_id=%s", customer_id)
-
-    # Primary: union over per-endpoint SOURCE tables that actually have settings_json
-    sql = f"""
-    WITH latest AS (
-      SELECT server_id, MAX(run_id) AS run_id
-      FROM {SCHEMA}.ingest_run
-      WHERE customer_id = %s
-      GROUP BY server_id
-    ),
-    repo AS (
-      SELECT d.endpoint_id,
-             UPPER(d.role) AS role,
-             COALESCE(d.db_settings_type,'(unknown)') AS db_settings_type
-      FROM {SCHEMA}.rep_database d
-      JOIN latest l ON l.run_id = d.run_id
-    ),
-    src_e AS (SELECT endpoint_id FROM repo WHERE role='SOURCE'),
-    tgt_e AS (SELECT endpoint_id FROM repo WHERE role='TARGET'),
-
-    /* Source-only: detect Log Stream via per-endpoint *source* tables WITH settings_json
-       IMPORTANT: If any of these tables don't exist or lack settings_json in your deployment,
-       delete that UNION ALL line rather than failing the query. */
-    flagged_logstream AS (
-      SELECT s.endpoint_id FROM {SCHEMA}.rep_db_sqlserver_source   s JOIN src_e USING(endpoint_id) WHERE CAST(s.settings_json AS text) ILIKE '%%logstreamstagingtask%%'
-      UNION ALL SELECT s.endpoint_id FROM {SCHEMA}.rep_db_mysql_source       s JOIN src_e USING(endpoint_id) WHERE CAST(s.settings_json AS text) ILIKE '%%logstreamstagingtask%%'
-      UNION ALL SELECT s.endpoint_id FROM {SCHEMA}.rep_db_oracle_source      s JOIN src_e USING(endpoint_id) WHERE CAST(s.settings_json AS text) ILIKE '%%logstreamstagingtask%%'
-      UNION ALL SELECT s.endpoint_id FROM {SCHEMA}.rep_db_db2_luw_source     s JOIN src_e USING(endpoint_id) WHERE CAST(s.settings_json AS text) ILIKE '%%logstreamstagingtask%%'
-      UNION ALL SELECT s.endpoint_id FROM {SCHEMA}.rep_db_db2_zos_source     s JOIN src_e USING(endpoint_id) WHERE CAST(s.settings_json AS text) ILIKE '%%logstreamstagingtask%%'
-      UNION ALL SELECT s.endpoint_id FROM {SCHEMA}.rep_db_db2_iseries_source s JOIN src_e USING(endpoint_id) WHERE CAST(s.settings_json AS text) ILIKE '%%logstreamstagingtask%%'
-      UNION ALL SELECT s.endpoint_id FROM {SCHEMA}.rep_db_postgresql_source  s JOIN src_e USING(endpoint_id) WHERE CAST(s.settings_json AS text) ILIKE '%%logstreamstagingtask%%'
-      UNION ALL SELECT s.endpoint_id FROM {SCHEMA}.rep_db_file_source        s JOIN src_e USING(endpoint_id) WHERE CAST(s.settings_json AS text) ILIKE '%%logstreamstagingtask%%'
-      UNION ALL SELECT s.endpoint_id FROM {SCHEMA}.rep_db_odbc_source        s JOIN src_e USING(endpoint_id) WHERE CAST(s.settings_json AS text) ILIKE '%%logstreamstagingtask%%'
-      UNION ALL SELECT s.endpoint_id FROM {SCHEMA}.rep_db_teradata_source    s JOIN src_e USING(endpoint_id) WHERE CAST(s.settings_json AS text) ILIKE '%%logstreamstagingtask%%'
-      UNION ALL SELECT s.endpoint_id FROM {SCHEMA}.rep_db_vsam_source        s JOIN src_e USING(endpoint_id) WHERE CAST(s.settings_json AS text) ILIKE '%%logstreamstagingtask%%'
-      UNION ALL SELECT s.endpoint_id FROM {SCHEMA}.rep_db_ims_source         s JOIN src_e USING(endpoint_id) WHERE CAST(s.settings_json AS text) ILIKE '%%logstreamstagingtask%%'
-    ),
-
-    /* Hard overrides by table-of-origin for DB2 variants on both roles */
-    forced_family AS (
-      SELECT endpoint_id, 'IBM DB2 for z/OS'    AS family FROM {SCHEMA}.rep_db_db2_zos_source    WHERE endpoint_id IN (SELECT endpoint_id FROM src_e)
-      UNION ALL SELECT endpoint_id, 'IBM DB2 for z/OS'    FROM {SCHEMA}.rep_db_db2_zos_target    WHERE endpoint_id IN (SELECT endpoint_id FROM tgt_e)
-      UNION ALL SELECT endpoint_id, 'IBM DB2 for iSeries' FROM {SCHEMA}.rep_db_db2_iseries_source WHERE endpoint_id IN (SELECT endpoint_id FROM src_e)
-      UNION ALL SELECT endpoint_id, 'IBM DB2 for iSeries' FROM {SCHEMA}.rep_db_db2_iseries_target WHERE endpoint_id IN (SELECT endpoint_id FROM tgt_e)
-    ),
-
-    repo2 AS (
-      SELECT r.endpoint_id, r.role,
-             CASE
-               WHEN r.role='SOURCE' AND EXISTS (SELECT 1 FROM flagged_logstream f WHERE f.endpoint_id=r.endpoint_id)
-                 THEN 'Log Stream'
-               WHEN EXISTS (SELECT 1 FROM forced_family ff WHERE ff.endpoint_id=r.endpoint_id)
-                 THEN (SELECT ff.family FROM forced_family ff WHERE ff.endpoint_id=r.endpoint_id LIMIT 1)
-               ELSE r.db_settings_type
-             END AS raw_type
-      FROM repo r
-    ),
-
-    /* Role-aware regex mapping to canonical family via endpoint_family_map */
-    src_mix AS (
-      SELECT COALESCE(m.family, r.raw_type) AS type, COUNT(*) AS uses
-      FROM repo2 r
-      LEFT JOIN LATERAL (
-        SELECT m.family
-        FROM {SCHEMA}.endpoint_family_map m
-        WHERE m.active
-          AND (m.role IS NULL OR UPPER(m.role) = r.role)
-          AND r.raw_type ~* m.pattern
-        ORDER BY m.priority ASC, length(m.pattern) DESC
-        LIMIT 1
-      ) m ON TRUE
-      WHERE r.role = 'SOURCE'
-      GROUP BY 1
-    ),
-    tgt_mix AS (
-      SELECT COALESCE(m.family, r.raw_type) AS type, COUNT(*) AS uses
-      FROM repo2 r
-      LEFT JOIN LATERAL (
-        SELECT m.family
-        FROM {SCHEMA}.endpoint_family_map m
-        WHERE m.active
-          AND (m.role IS NULL OR UPPER(m.role) = r.role)
-          AND r.raw_type ~* m.pattern
-        ORDER BY m.priority ASC, length(m.pattern) DESC
-        LIMIT 1
-      ) m ON TRUE
-      WHERE r.role = 'TARGET'
-      GROUP BY 1
-    )
-    SELECT 'SOURCE' AS side, type, uses FROM src_mix
-    UNION ALL
-    SELECT 'TARGET' AS side, type, uses FROM tgt_mix
-    ORDER BY side, uses DESC, type;
-    """
-
-    try:
-        rows = await _all(conn, sql, (customer_id,)) or []
-        dbg("Query rows=%s", len(rows))
-    except Exception as e:
-        # Fallback if the union references a missing *_source table OR mapping table not present.
-        try:
-            log.warning("endpoint mix primary query failed, fallback path: %s", e)
-        except Exception:
-            pass
-        sql_fb = f"""
-        WITH latest AS (
-          SELECT server_id, MAX(run_id) AS run_id
-          FROM {SCHEMA}.ingest_run
-          WHERE customer_id = %s
-          GROUP BY server_id
-        ),
-        repo AS (
-          SELECT UPPER(d.role) AS side,
-                 COALESCE(d.db_settings_type,'(unknown)') AS type
-          FROM {SCHEMA}.rep_database d
-          JOIN latest l ON l.run_id = d.run_id
-        )
-        SELECT side, type, COUNT(*) AS uses
-        FROM repo
-        GROUP BY side, type
-        ORDER BY side, uses DESC, type;
-        """
-        rows = await _all(conn, sql_fb, (customer_id,)) or []
-
-    source_mix, target_mix = [], []
-    for r in rows:
-        side = (r.get("side") or "").upper()
-        typ  = (r.get("type") or "Unknown").strip()
-        uses = int(r.get("uses") or 0)
-        if side == "SOURCE":
-            source_mix.append({"type": "Log Stream" if typ == "Log Stream" else typ, "uses": uses})
-        else:
-            target_mix.append({"type": typ, "uses": uses})
-
-    source_mix.sort(key=lambda x: (-x["uses"], x["type"]))
-    target_mix.sort(key=lambda x: (-x["uses"], x["type"]))
-    dbg("FINAL src=%s tgt=%s", source_mix, target_mix)
-    return source_mix, target_mix
-
-
     
     def dbg(msg, *args):
         if DBG:
@@ -3281,14 +2874,8 @@ async def render_metricslog_90d_sections(doc, conn, customer_id: int, server_id:
         task_map   = await _load_task_name_map(conn_t90, customer_id, server_id)
         family_map = await _load_family_name_map(conn_t90)
 
-
-        # Helper: only keep tasks whose tkey resolves to a current task name
-        def _is_resolved_taskkey(k):
-            sk = str(k) if k is not None else ""
-            return (k in task_map) or (sk in task_map)
         # Heading + window
         _add_heading(doc, f"MetricsLog – 90-Day Window ({server_name})", level=3)
-        _add_text(doc, "Only current active (name-resolved) tasks are considered across averages and charts.", size=9, italic=True)
         try:
             if t90 and t90[0].window_start and t90[0].window_end:
                 _add_text(doc, f"Data window: {t90[0].window_start:%Y-%m-%d} → {t90[0].window_end:%Y-%m-%d} (based on latest log event).", size=9)
@@ -3299,17 +2886,14 @@ async def render_metricslog_90d_sections(doc, conn, customer_id: int, server_id:
         if not t90:
             _add_text(doc, "No per-task health rows were found in the last 90 days for this server.", size=10, italic=True)
         else:
-            
-            _t90_resolved = [t for t in t90 if _is_resolved_taskkey(t.tkey)]
-            _base = _t90_resolved if _t90_resolved else t90
-            avg_uptime = sum(t.uptime_pct for t in _base) / max(1, len(_base))
+            avg_uptime = sum(t.uptime_pct for t in t90) / max(1, len(t90))
             _add_text(doc, f"Avg Uptime (tasks): {_fmt_pct_t90(avg_uptime)}", size=9)
 
             def _task_label(k: str) -> str:
                 return task_map.get(k, task_map.get(str(k), k))
 
-            stable_sorted  = [t for t in sorted(t90, key=_stable_score_t90, reverse=True) if _is_resolved_taskkey(t.tkey)]
-            flapper_sorted = [t for t in sorted(t90, key=_flapper_score_t90, reverse=True) if _is_resolved_taskkey(t.tkey)]
+            stable_sorted  = sorted(t90, key=_stable_score_t90, reverse=True)
+            flapper_sorted = sorted(t90, key=_flapper_score_t90, reverse=True)
             top_stable = [t for t in stable_sorted if t.rows_moved >= 10000][:3]
             top_flap   = [t for t in flapper_sorted if (t.restarts_per_day >= 0.5 or t.error_stop_rate > 0.0)][:2]
 
@@ -3375,11 +2959,11 @@ async def render_metricslog_90d_sections(doc, conn, customer_id: int, server_id:
         else:
             _add_text(doc, "No endpoint activity in the last 90 days.", size=9, italic=True)
 
-        # Server Top-5 Flappers (only name-resolved)
+        # Server Top-5 Flappers
         if t90:
             _add_heading(doc, "Server Top-5 Flappers", level=4)
-            flapper_sorted = [t for t in sorted(t90, key=_flapper_score_t90, reverse=True) if _is_resolved_taskkey(t.tkey)]
-            top5 =  [t for t in flapper_sorted if (t.restarts_per_day >= 0.5 or t.error_stop_rate > 0.0)][:5]
+            flapper_sorted = sorted(t90, key=_flapper_score_t90, reverse=True)
+            top5 = [t for t in flapper_sorted if (t.restarts_per_day >= 0.5 or t.error_stop_rate > 0.0)][:5]
             if top5:
                 _add_table_t90(doc,
                     ["Task", "Uptime", "Downtime (h)", "Restarts (total)", "Restarts/Day", "Median Run"],
