@@ -1,208 +1,96 @@
-# Qlik RepMeta  
-> **Customer Inventory + Operational Insights for Qlik Replicate**
+# Qlik RepMeta
 
-![FastAPI](https://img.shields.io/badge/backend-FastAPI-green)
-![React](https://img.shields.io/badge/frontend-React%20%2B%20Vite-blue)
-![PostgreSQL](https://img.shields.io/badge/database-PostgreSQL-blueviolet)
-![License](https://img.shields.io/badge/license-MIT-lightgrey)
+> Customer inventory + operational insights for Qlik Replicate
+
+![Qlik RepMeta banner](./Qlik_Banner.png)
 
 ---
 
-## 🌟 Overview
+## Table of Contents
 
-**Qlik RepMeta** is a self-service internal tool for CSEs and Solution Architects to analyze Qlik Replicate environments.  
-Upload your **Replicate Repository JSONs**, **QEM TSV metrics**, and (optionally) a **Replicate task log** to:
-
-- Normalize data into **PostgreSQL**  
-- **Browse** counts and trends via a React UI  
-- Generate a **modern Customer Technical Overview (.docx)** including:
-  - KPI cards and posture vs. the latest GA Replicate train  
-  - Endpoint mix (source & target usage)  
-  - License coverage vs. customer usage  
-  - Insights (null targets, duplicate endpoint configs)  
-  - Server roll-ups & Source×Target coverage matrix  
-
----
-
-## 🏗 Architecture
-
-```
-C:\qlik-repmeta\
-├─ backend\app\
-│  ├─ main.py          # FastAPI routes
-│  ├─ ingest.py        # Repo JSON ingest
-│  ├─ ingest_qem.py    # QEM TSV ingest
-│  ├─ export_report.py # Generates Customer Technical Overview
-│  ├─ db.py            # psycopg3 async DB helper
-│  └─ .env.example
-└─ frontend\repmeta-ui\src\
-   ├─ App.tsx          # Main UI
-   ├─ DataBrowser.tsx  # Browse counts
-   ├─ ReportExport.tsx # Export logic
-   └─ .env.example
-```
+- [Overview](#overview)
+- [What RepMeta Gives You](#what-repmeta-gives-you)
+- [Architecture](#architecture)
+- [Inputs & Outputs](#inputs--outputs)
+- [Getting Started](#getting-started)
+  - [Prerequisites](#prerequisites)
+  - [Clone the Repo](#clone-the-repo)
+  - [Database Setup](#database-setup)
+  - [Backend Setup (FastAPI)](#backend-setup-fastapi)
+  - [Frontend Setup (React)](#frontend-setup-react)
+- [Typical Workflow](#typical-workflow)
+- [Database Schema Highlights](#database-schema-highlights)
+- [Customer Technical Overview (.docx)](#customer-technical-overview-docx)
+- [Roadmap / Ideas](#roadmap--ideas)
+- [Contributing](#contributing)
+- [Notes & Limitations](#notes--limitations)
+- [License](#license)
 
 ---
 
-## ✨ Key Features
+## Overview
 
-- **FastAPI** backend (async psycopg3) for ingestion and export  
-- **React + Vite + Tailwind** UI for uploads, browsing and download  
-- **PostgreSQL** normalized schema for:
-  - Customers, servers, runs
-  - Replicate tasks, endpoints, QEM performance metrics  
-  - License details and master endpoint lists  
-- **Modern docx export** with:
-  - KPI cards  
-  - Posture vs. latest GA Replicate release  
-  - Source & Target endpoint mix  
-  - License usage matrix  
-  - Null target detection and duplicate endpoint configs  
+Qlik RepMeta is a self-service internal tool for Qlik CSEs, Solution Architects and PS to quickly understand a customer’s Qlik Replicate footprint.
+
+You upload **Replicate Repository JSONs**, **QEM TSV metrics**, and (optionally) a **Replicate task log**. RepMeta:
+
+- Normalizes everything into **PostgreSQL**
+- Exposes a **React UI** to browse counts, trends and inventory
+- Generates a **Qlik-branded Customer Technical Overview (.docx)** that you can drop straight into a customer meeting
+
+> ⚠️ RepMeta is **not an official Qlik product** – it’s a field tool to speed up platform reviews, scoping conversations and quarterly health checks.
 
 ---
 
-## 🚀 Quick Start (Windows)
+## What RepMeta Gives You
 
-### 1. Clone and Setup
+From a handful of artifacts, RepMeta builds:
 
-```powershell
-git clone https://github.com/tejqliky/qlik-repmeta.git
-cd qlik-repmeta
-```
-
-### 2. Database
-
-```sql
--- Create DB and schema
-CREATE DATABASE repmeta;
-\c repmeta
-CREATE SCHEMA IF NOT EXISTS repmeta;
-
--- Apply migration scripts or run provided SQL
-```
-
-### 3. Backend
-
-```powershell
-cd backend
-python -m venv .venv
-.venv\Scripts\activate
-pip install -r requirements.txt
-
-copy .env.example .env  # update DATABASE_URL etc.
-
-# Start API
-python -m uvicorn app.main:app --host 127.0.0.1 --port 8002 --reload
-```
-
-### 4. Frontend
-
-```powershell
-cd ..\frontend\repmeta-ui
-npm install
-copy .env.example .env  # set VITE_API_BASE to backend URL
-npm run dev
-```
-
-Open **http://localhost:5173** in your browser.
+- **Inventory view**
+  - Servers, tasks, endpoints and endpoint families
+  - Source/target mix across the environment
+- **Operational posture**
+  - Task counts by status
+  - QEM-derived throughput and latency metrics (where available)
+- **License vs usage**
+  - How licensed endpoint families compare to what the customer is actually using
+- **Data-driven insights**
+  - Tasks with **null targets** or “dangling” configurations
+  - **Duplicate endpoint configurations** worth consolidating
+  - Source × Target coverage matrix to spot gaps and common patterns
+- **Customer-ready document**
+  - Single click export of a **Customer Technical Overview** branded with Qlik logo and banner
 
 ---
 
-## 🔄 Typical Workflow
+## Architecture
 
-1. Add **Customer**  
-2. Upload **Repo JSON** per server  
-3. Upload **QEM TSV** (mapping TSV if needed)  
-4. (Optional) Upload **Replicate task log** (extract license info)  
-5. Export **Customer Technical Overview (.docx)**  
+At a high level:
 
----
-
-## 🧩 Environment Variables
-
-### Backend (`backend/.env`)
-
-| Variable           | Description                                              |
-|-------------------|----------------------------------------------------------|
-| `DATABASE_URL`     | Postgres URL with credentials                             |
-| `REPMETA_SCHEMA`   | Schema name (default `repmeta`)                           |
-| `GITHUB_TOKEN`     | Optional token for higher GitHub API rate limits          |
-
-### Frontend (`frontend/repmeta-ui/.env`)
-
-| Variable         | Description                       |
-|-----------------|-----------------------------------|
-| `VITE_API_BASE`  | Base URL of the backend FastAPI    |
-
----
-
-## 📊 Database Schema Highlights
-
-- `dim_customer` - Customers  
-- `dim_server` - Servers  
-- `ingest_run` - Replicate ingestion runs  
-- `rep_database` / `rep_task` - Endpoints & tasks  
-- `qem_task_perf` - QEM TSV metrics  
-- `replicate_latest_release_cache` - Latest GA Replicate version (auto-cached)  
-- `endpoint_master_sources` / `endpoint_master_targets` - Master endpoint lists  
-- `endpoint_alias_map` - Canonical alias mapping  
-
----
-
-## 📝 Customer Technical Overview (.docx)
-
-- **Executive Summary** - KPI cards + posture vs. GA train  
-- **Customer Insights** - Null targets & duplicate endpoint configs  
-- **Environment & Inventory** - Server roll-up & last ingests  
-- **Coverage Matrix** - Source × Target  
-- **License Usage** - Licensed vs. used endpoints  
-- **Server Deep Dives** - Top pairs and metrics  
-
----
-
-## 🤝 Contributing
-
-- Use feature branches (`feature/<topic>`).  
-- Run Black/isort (Python) and Prettier/Eslint (TS) before PRs.  
-- Open PRs to `dev`; merge to `main` after review.  
-
-See [CONTRIBUTING.md](CONTRIBUTING.md) for details.
-
----
-
-## 📦 Deployment / Hosting
-
-- The app can run locally or in Docker containers.  
-- For internal distribution, host backend on a Windows or Linux server and serve frontend via Netlify, Vercel or GitHub Pages.  
-- Database can be self-hosted Postgres or managed cloud Postgres.
-
----
-
-## 🛡 Security
-
-- `.env` files are **not committed**.  
-- Use GitHub Secrets for CI/CD.  
-- Rotate credentials periodically.
-
----
-
-## 📚 Roadmap / Ideas
-
-- [ ] Inline dashboard in UI for quick KPIs  
-- [ ] Automated email of .docx report to CSEs  
-- [ ] Extended license analysis vs. actual usage  
-- [ ] Multi-customer dashboards & trending  
-
----
-
-## 📄 License
-
-MIT License - see [LICENSE](LICENSE).
-
----
-
-## 🙌 Acknowledgments
-
-Inspired by real-world CSE needs to streamline Qlik Replicate platform reviews.
-
----
+```text
+Qlik artifacts  ──►  FastAPI (backend/app)  ──►  PostgreSQL (repmeta schema)
+                        │
+                        ▼
+                 React + Vite UI (frontend/repmeta-ui)
+qlik-repmeta/
+├─ backend/
+│  └─ app/
+│     ├─ main.py          # FastAPI routes & dependency wiring
+│     ├─ ingest.py        # Replicate repository JSON ingest
+│     ├─ ingest_qem.py    # QEM TSV ingest
+│     ├─ export_report.py # Generates Customer Technical Overview (.docx)
+│     ├─ db.py            # psycopg3 async DB helper
+│     └─ .env.example     # Backend env vars template
+├─ frontend/
+│  └─ repmeta-ui/
+│     ├─ src/
+│     │  ├─ App.tsx          # Main UI shell
+│     │  ├─ DataBrowser.tsx  # Simple counts / lists
+│     │  ├─ ReportExport.tsx # Report export flows
+│     │  └─ ...              # Other React components
+│     └─ .env.example        # Frontend env vars template
+├─ schema.sql                # PostgreSQL schema for repmeta
+├─ postgres - repmeta.png    # Logical schema diagram
+├─ Basic_Template.docx       # Base Word template for export
+├─ Qlik_Banner.png           # Banner used in exported docs
+└─ Qlik_logo.png             # Qlik logo used in exported docs
