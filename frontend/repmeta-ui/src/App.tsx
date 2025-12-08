@@ -1,5 +1,7 @@
+import type { KeyboardEvent } from "react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import QlikSenseTab from "./QlikSenseTab"; // <- keep side-by-side with this file
+import TalendTab from "./TalendTab"; // <- new Talend tab
 
 /** Types */
 type Customer = { customer_id: number; customer_name: string };
@@ -1846,12 +1848,12 @@ function ReplicateTab() {
    TOP-LEVEL APP W/ TABS
    ========================= */
 export default function App() {
-  const [active, setActive] = useState<"replicate" | "qliksense">(() => {
+  const [active, setActive] = useState<"replicate" | "qliksense" | "talend">(() => {
     const url = new URL(window.location.href);
     const q = (url.searchParams.get("tab") || "").toLowerCase();
     const stored = (localStorage.getItem(LS_ACTIVE_TAB) || "").toLowerCase();
-    if (q === "qliksense" || q === "replicate") return q as any;
-    if (stored === "qliksense" || stored === "replicate") return stored as any;
+    if (q === "qliksense" || q === "replicate" || q === "talend") return q as any;
+    if (stored === "qliksense" || stored === "replicate" || stored === "talend") return stored as any;
     return "replicate";
   });
 
@@ -1865,13 +1867,14 @@ export default function App() {
     window.history.replaceState({}, "", url.toString());
   }, [active]);
 
-  const tabs: Array<{ id: "replicate" | "qliksense"; label: string; emoji: string }> = [
+  const tabs: Array<{ id: "replicate" | "qliksense" | "talend"; label: string; emoji: string }> = [
     { id: "replicate", label: "Replicate", emoji: "🔁" },
     { id: "qliksense", label: "Qlik Sense", emoji: "🧠" },
+    { id: "talend", label: "Talend", emoji: "🧬" },
   ];
 
-  function onKeyDown(e: React.KeyboardEvent<HTMLDivElement>) {
-    const order = ["replicate", "qliksense"] as const;
+  function onKeyDown(e: KeyboardEvent<HTMLDivElement>) {
+    const order = ["replicate", "qliksense", "talend"] as const;
     const idx = order.indexOf(active);
     if (e.key === "ArrowRight") {
       setActive(order[(idx + 1) % order.length]);
@@ -1930,7 +1933,7 @@ export default function App() {
       </header>
 
       {/* Body renders active tab */}
-      {active === "replicate" ? <ReplicateTab /> : <QlikSenseTab />}
+      {active === "replicate" ? <ReplicateTab /> : active === "qliksense" ? <QlikSenseTab /> : <TalendTab />}
 
       {/* Small global styles for animations used by both tabs */}
       <style>{`

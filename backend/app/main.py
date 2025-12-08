@@ -31,6 +31,7 @@ from .ingest import (
 )
 
 from .license_routes import router as license_router  # license upload routes
+from .routes_talend import router as talend_router  # Talend staging & runs
 
 LOG = logging.getLogger("api")
 
@@ -52,6 +53,7 @@ app = FastAPI(title=API_TITLE, version=API_VERSION)
 
 # Register sub-routers
 app.include_router(license_router)
+app.include_router(talend_router, prefix="/talend")
 # IMPORTANT: expose Qlik Sense routes at ROOT (no '/api' prefix) for the new UI
 app.include_router(qliksense_router)
 
@@ -545,7 +547,7 @@ async def _run_repository_upload_job(job_id: str, data_bytes: bytes, filename: s
         success = 1 if ok else 0
         failed = 0 if ok else 1
         await _emit(js, {"type": "job_completed", "total": total, "success": success, "failed": failed})
-        await _jobs_finish(job_id, result={"total": total, "success": success, "failed": failed, "results": [res] if res else []})
+        await _jobs_finish(job_id, result={"total": 1, "success": success, "failed": failed, "results": [res] if res else []})
     except Exception as e:
         await _emit(js, {"type": "error", "message": str(e)})
         await _emit(js, {"type": "job_completed", "total": 1, "success": 0, "failed": 1})
