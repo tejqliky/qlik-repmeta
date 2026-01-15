@@ -27,7 +27,7 @@ type PipelineStepId = 1 | 2 | 3 | 4;
 type RunStatus = "idle" | "running" | "success" | "error";
 type HistoryFilter = "all" | "success" | "failed";
 
-const API_BASE = (import.meta.env.VITE_API_BASE as string | undefined) || "/api";
+const API_BASE = "http://127.0.0.1:8002";
 
 const TalendTab: React.FC = () => {
   const [accounts, setAccounts] = useState<Account[]>([]);
@@ -90,13 +90,13 @@ const TalendTab: React.FC = () => {
     try {
       const res = await fetch(`${API_BASE}/talend/runs/${accountId}`);
       if (!res.ok) {
-        console.warn("Failed to retrieve data loading history, status=", res.status);
+        console.warn("Failed to load Talend run history, status=", res.status);
         return;
       }
       const data = (await res.json()) as RunHistoryEntry[];
       setRunHistory(data || []);
     } catch (err) {
-      console.warn("Failed to retrieve data loading run history", err);
+      console.warn("Failed to load Talend run history", err);
     }
   }, []);
 
@@ -217,8 +217,8 @@ const TalendTab: React.FC = () => {
       const data = (await res.json()) as RunDetail;
       setRunDetail(data);
     } catch (err: any) {
-      console.error("Failed to retrieve data loading run detail", err);
-      setDetailError(err?.message || "Failed to retrieve data loading run detail.");
+      console.error("Failed to load Talend run detail", err);
+      setDetailError(err?.message || "Failed to load Talend run detail.");
     } finally {
       setIsLoadingDetail(false);
     }
@@ -271,7 +271,7 @@ const TalendTab: React.FC = () => {
       if (!res.ok) {
         const msg =
           (data && data.detail) ||
-          `Failed to execute data loading (${res.status})`;
+          `Failed to execute Talend job (${res.status})`;
         throw new Error(msg);
       }
 
@@ -283,13 +283,13 @@ const TalendTab: React.FC = () => {
       if (logicalStatus === "success") {
         setRunStatus("success");
         setStatusMessage(
-          `Loading data job completed successfully (exit ${data.exit_code}).`
+          `Talend job completed successfully (exit ${data.exit_code}).`
         );
       } else {
         setRunStatus("error");
         setError(
           data?.stderr ||
-            "Loading data job reported an error. See loading logs for details."
+            "Talend job reported an error. See Talend logs for details."
         );
       }
 
@@ -299,7 +299,7 @@ const TalendTab: React.FC = () => {
     } catch (e: any) {
       console.error(e);
       setRunStatus("error");
-      setError(e?.message || "Failed to execute loading data job.");
+      setError(e?.message || "Failed to execute Talend job.");
     }
   };
 
@@ -374,12 +374,15 @@ const TalendTab: React.FC = () => {
           <div>
             <div className="flex items-center gap-2">
               <h2 className="text-2xl font-semibold text-gray-900">
-                Talend Deployment Inventory
+                Talend Orchestration
               </h2>
+              <span className="rounded-full bg-green-50 px-2 py-0.5 text-[11px] font-medium text-green-700 ring-1 ring-green-100">
+                Talend pipeline (beta)
+              </span>
             </div>
             <p className="text-sm text-gray-500">
-              Select an account, upload artifacts, and trigger a loading data job
-              directly from RepMeta.
+              Select an account, upload artifacts, and orchestrate a Talend job
+              run directly from RepMeta.
             </p>
           </div>
         </div>
@@ -440,22 +443,22 @@ const TalendTab: React.FC = () => {
               {renderPipelineStep(
                 1,
                 "Select Account",
-                "Choose the customer account and tenant from CRM."
+                "Choose the Talend account from qtcmeta.ACCOUNT."
               )}
               {renderPipelineStep(
                 2,
-                "Attach Config Data",
-                "Select config data provided for to the account."
+                "Attach Artifacts",
+                "Upload CSEAT CSV exports and the QTCMT H2 database."
               )}
               {renderPipelineStep(
                 3,
-                "Load Config Data",
-                "Upoad the config data to the application repository."
+                "Run Talend Job",
+                "RepMeta triggers run_artifact.py with the selected account."
               )}
               {renderPipelineStep(
                 4,
                 "Review Run History",
-                "Inspect recent data load runs initiated from this console."
+                "Inspect recent Talend runs initiated from this console."
               )}
             </div>
           </section>
@@ -510,7 +513,7 @@ const TalendTab: React.FC = () => {
             <div className="mb-3 flex items-start justify-between gap-4">
               <div>
                 <h3 className="text-sm font-semibold text-gray-900">
-                  Customer Account &amp; Tenant
+                  Talend Account &amp; Tenant
                 </h3>
                 <p className="text-xs text-gray-500">
                   Accounts and tenant IDs are managed in the{" "}
@@ -587,13 +590,17 @@ const TalendTab: React.FC = () => {
           {/* Artifacts & Run */}
           <section className="rounded-xl bg-white p-5 shadow-sm ring-1 ring-gray-100">
             <h3 className="text-sm font-semibold text-gray-900">
-              Talend Artifacts
+              Talend Artifacts &amp; Job
             </h3>
             <p className="mb-4 text-xs text-gray-500">
-              CSEAT exports and the QTCMT database will be staged to the temporary
-              locations (for local dev:{" "}
+              CSEAT exports and the QTCMT database will be staged to the Talend
+              job locations (for local dev:{" "}
               <code className="rounded bg-gray-100 px-1 py-0.5 text-[11px]">
-                C:\tmp\CS_AUTO\&lt account_id &gt\&lt tenant_id &gt
+                C:\qtcmt
+              </code>{" "}
+              and{" "}
+              <code className="rounded bg-gray-100 px-1 py-0.5 text-[11px]">
+                C:\tmp\CS_AUTO
               </code>
               ), before calling{" "}
               <code className="rounded bg-gray-100 px-1 py-0.5 text-[11px]">
@@ -616,7 +623,7 @@ const TalendTab: React.FC = () => {
                   )}
                 </div>
                 <p className="mb-2 text-[11px] text-gray-500">
-                  One or more CSEAT exports. Multiple CSVs from the same environment can be uploaded on a
+                  One or more CSEAT exports. Multiple CSVs can be uploaded for a
                   single run.
                 </p>
                 <input
@@ -689,7 +696,7 @@ const TalendTab: React.FC = () => {
                     : "bg-green-600 hover:bg-green-700"
                 }`}
               >
-                {isRunning ? "Loading…" : "Load Raw Data"}
+                {isRunning ? "Running…" : "Run Talend Job"}
               </button>
 
               <button
@@ -713,7 +720,7 @@ const TalendTab: React.FC = () => {
             <div className="mb-3 flex items-center justify-between">
               <div>
                 <h3 className="text-sm font-semibold text-gray-900">
-                  Data Loading History
+                  Talend Run History
                 </h3>
                 <p className="text-xs text-gray-500">
                   Persisted in{" "}

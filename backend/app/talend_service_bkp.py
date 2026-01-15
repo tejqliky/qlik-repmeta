@@ -13,47 +13,54 @@ from .db import connection  # existing async DB helper
 
 
 # ============================================================
-#  Paths & Configuration (repo-first, overridable by env)
+#  Configuration & Constants
 # ============================================================
 
-APP_DIR = Path(__file__).resolve().parent                # .../backend/app
-PROJECT_DIR = APP_DIR.parent                             # .../backend
-ORCH_DIR = APP_DIR / "talend_orchestration"              # in-repo orchestration
-
-# Staging roots (must be visible to the Talend Remote Engine jobs if they read files)
+# OS-specific defaults for local dev staging
+DEFAULT_QTCMT_ROOT = r"C:\qtcmt" if os.name == "nt" else "/qtcmt"
 DEFAULT_TMP_ROOT = r"C:\tmp\CS_AUTO" if os.name == "nt" else "/tmp/CS_AUTO"
+
+# Where Talend expects the H2 file and CSEAT CSVs (local staging)
+TALEND_QTCMT_ROOT = Path(os.getenv("TALEND_QTCMT_ROOT", DEFAULT_QTCMT_ROOT))
 TALEND_TMP_ROOT = Path(os.getenv("TALEND_TMP_ROOT", DEFAULT_TMP_ROOT))
 
-# What we pass to the Talend job as --input tmp_folder=... and --input database_path=...
-# By default, keep them aligned to the actual staging roots.
-TMP_FOLDER_ARG = os.getenv("TALEND_TMP_FOLDER_ARG", str(TALEND_TMP_ROOT))
+# Default location of run_artifact.py depending on OS
+DEFAULT_RUN_ARTIFACT_PATH = (
+    r"C:\talend_job\run_artifact.py"
+    if os.name == "nt"
+    else "/home/qmi/talend_job/run_artifact.py"
+)
+RUN_ARTIFACT_PATH = Path(
+    os.getenv("TALEND_RUN_ARTIFACT_PATH", DEFAULT_RUN_ARTIFACT_PATH)
+)
 
-# Runner execution mode:
-# - module (recommended in Docker): python -m app.talend_orchestration.run_artifact
-# - script: python /path/to/run_artifact.py
-RUN_MODE = os.getenv("TALEND_RUN_MODE", "module").strip().lower()
-RUN_MODULE = os.getenv("TALEND_RUN_ARTIFACT_MODULE", "app.talend_orchestration.run_artifact")
-
-DEFAULT_RUN_ARTIFACT_PATH = ORCH_DIR / "run_artifact.py"
-RUN_ARTIFACT_PATH = Path(os.getenv("TALEND_RUN_ARTIFACT_PATH", str(DEFAULT_RUN_ARTIFACT_PATH)))
-
-DEFAULT_CONFIG_PATH = ORCH_DIR / "tmc_artifacts.json"
-CONFIG_PATH = Path(os.getenv("TALEND_CONFIG_PATH", str(DEFAULT_CONFIG_PATH)))
-
-# Optional JSON env overlay (useful for local dev; in prod you can use env_file / secrets)
-DEFAULT_ENV_FILE = APP_DIR / "config" / "talend" / "talend_env.json"
-TALEND_ENV_FILE = Path(os.getenv("TALEND_ENV_FILE", str(DEFAULT_ENV_FILE)))
+# Env JSON file (Talend credentials) – by default next to run_artifact.py
+TALEND_ENV_FILE = Path(
+    os.getenv("TALEND_ENV_FILE", str(RUN_ARTIFACT_PATH.with_name("talend_env.json")))
+)
 
 # Python binary – default to the same one running uvicorn
 PYTHON_BIN = os.getenv("TALEND_PYTHON_BIN", sys.executable)
 
-ARTIFACT_CSEAT = os.getenv("TALEND_ARTIFACT_CSEAT", "CSEAT_uploadAssetsData")
-ARTIFACT_QTCMT = os.getenv("TALEND_ARTIFACT_QTCMT", "QTCMT_uploadAssetsData")
-ARTIFACT_TMCAT = os.getenv("TALEND_ARTIFACT_TMCAT", "TMCAT_uploadAssetsData")  
+# Config + artifact names, aligned to your working CLI
+DEFAULT_CONFIG_PATH = RUN_ARTIFACT_PATH.with_name("tmc_artifacts.json")
+CONFIG_PATH = Path(os.getenv("TALEND_CONFIG_PATH", str(DEFAULT_CONFIG_PATH)))
 
-TIMEOUT_SECONDS = int(os.getenv("TALEND_TIMEOUT_SECONDS", "60"))
+ARTIFACT_NAME = os.getenv("TALEND_ARTIFACT_NAME", "QTCMT_uploadAssetsData")
 
-# Ensure staging dirs exist
+# Values passed to --input database_path=... and --input tmp_folder=...
+DEFAULT_DB_PATH_ARG = r"C:\qtcmt" if os.name == "nt" else "/qtcmt"
+DEFAULT_TMP_FOLDER_ARG = r"C:\tmp\CS_AUTO" if os.name == "nt" else "/tmp/CS_AUTO"
+
+DB_PATH_ARG = os.getenv("TALEND_DB_PATH_ARG", DEFAULT_DB_PATH_ARG)
+TMP_FOLDER_ARG = os.getenv("TALEND_TMP_FOLDER_ARG", DEFAULT_TMP_FOLDER_ARG)
+
+# Timeout (seconds) for the Talend runner (maps to --timeout)
+# You already have TALEND_TIMEOUT_SECONDS=1 in your env for snappy returns.
+TIMEOUT_SECONDS = int(os.getenv("TALEND_TIMEOUT_SECONDS", "1"))
+
+# Ensure local staging dirs exist
+TALEND_QTCMT_ROOT.mkdir(parents=True, exist_ok=True)
 TALEND_TMP_ROOT.mkdir(parents=True, exist_ok=True)
 
 
@@ -110,46 +117,46 @@ async def get_all_accounts() -> List[Dict[str, str]]:
 # ============================================================
 
 def _save_upload(file_obj: UploadFile, dest: Path) -> None:
+    """Stream an uploaded file to disk."""
     dest.parent.mkdir(parents=True, exist_ok=True)
     with dest.open("wb") as buffer:
         shutil.copyfileobj(file_obj.file, buffer)
 
 
-def _resolve_config() -> Dict[str, Any]:
-    return {"path": CONFIG_PATH, "exists": CONFIG_PATH.is_file()}
-
-
 def _resolve_runner() -> Dict[str, Any]:
     """
-    Resolve runner according to RUN_MODE.
-    For module mode, we still validate that the in-repo file exists by default.
+    Try to find a usable run_artifact script.
+    Returns { found: bool, path: Path, tried: [str, ...] }.
     """
-    if RUN_MODE == "module":
-        # Validate that the in-repo file exists (helps catch missing copies in deployments)
-        exists = DEFAULT_RUN_ARTIFACT_PATH.is_file()
-        return {
-            "mode": "module",
-            "found": exists,
-            "module": RUN_MODULE,
-            "path": str(DEFAULT_RUN_ARTIFACT_PATH),
-            "tried": [f"-m {RUN_MODULE} (expects {DEFAULT_RUN_ARTIFACT_PATH})"],
-        }
-
-    # script mode
     candidates: List[Path] = [RUN_ARTIFACT_PATH]
+    if RUN_ARTIFACT_PATH.suffix == "":
+        candidates.append(RUN_ARTIFACT_PATH.with_suffix(".py"))
+    else:
+        candidates.append(RUN_ARTIFACT_PATH.with_suffix(""))
+
     tried: List[str] = []
     for p in candidates:
         tried.append(str(p))
         if p.is_file():
-            return {"mode": "script", "found": True, "path": p, "tried": tried}
+            return {"found": True, "path": p, "tried": tried}
 
-    return {"mode": "script", "found": False, "path": RUN_ARTIFACT_PATH, "tried": tried}
+    return {"found": False, "path": RUN_ARTIFACT_PATH, "tried": tried}
+
+
+def _resolve_config() -> Dict[str, Any]:
+    """
+    Resolve tmc_artifacts.json next to run_artifact.py by default.
+    Returns { path: Path, exists: bool }.
+    """
+    cfg = CONFIG_PATH
+    return {"path": cfg, "exists": cfg.is_file()}
+
 
 def _build_talend_env() -> Dict[str, str]:
     """
     Build environment for the Talend runner:
     - start from current process env
-    - overlay any keys from talend_env.json (optional)
+    - overlay any keys from talend_env.json
     """
     env: Dict[str, str] = dict(os.environ)
 
@@ -162,52 +169,72 @@ def _build_talend_env() -> Dict[str, str]:
                     continue
                 if isinstance(value, (str, int, float, bool)):
                     env[str(key)] = str(value)
-    except Exception as e:
+    except Exception as e:  # non-fatal; just surface a warning
         env["TALEND_ENV_WARNING"] = f"Failed to load {TALEND_ENV_FILE}: {repr(e)}"
 
     return env
 
+
 # ============================================================
 #  Staging Logic (local paths)
 # ============================================================
-async def stage_cseat_files(account_id: str, tenant_id: str, files: List[UploadFile]) -> List[str]:
+
+async def stage_cseat_files(
+    account_id: str,
+    tenant_id: str,
+    files: List[UploadFile],
+) -> List[str]:
     """
-    Save uploaded CSEAT CSV files into TMP root:
-      <tmp_root>/<account_id>/<tenant_id>/raw/<filename>
+    Save uploaded CSEAT CSV files into the Talend tmp_folder root.
+
+    Windows default:
+        C:\\tmp\\CS_AUTO\\<filename>
+    Linux default:
+        /tmp/CS_AUTO/<filename>
     """
-    raw_dir = TALEND_TMP_ROOT / account_id / tenant_id / "raw"
-    raw_dir.mkdir(parents=True, exist_ok=True)
+    tmp_dir = TALEND_TMP_ROOT
+    tmp_dir.mkdir(parents=True, exist_ok=True)
 
     saved_paths: List[str] = []
     for idx, f in enumerate(files, start=1):
         fname = f.filename or f"CSEAT_{idx}.csv"
-        dest = raw_dir / fname
+        dest = tmp_dir / fname
         _save_upload(f, dest)
         saved_paths.append(str(dest))
+
     return saved_paths
 
 
-async def stage_qtcmt_file(account_id: str, tenant_id: str, file: Optional[UploadFile]) -> Optional[str]:
+async def stage_qtcmt_file(
+    account_id: str,
+    tenant_id: str,
+    file: Optional[UploadFile],
+) -> Optional[str]:
     """
-    Save uploaded QTCMT H2 file into TMP root:
-      <tmp_root>/<account_id>/<tenant_id>/qtcmt.mv.db
+    Save uploaded QTCMT H2 file into the Talend database_path root.
+
+    Windows default:
+        C:\\qtcmt\\qtcmt.mv.db
+    Linux default:
+        /qtcmt/qtcmt.mv.db
     """
     if not file:
         return None
 
-    tenant_dir = TALEND_TMP_ROOT / account_id / tenant_id
-    tenant_dir.mkdir(parents=True, exist_ok=True)
+    qtcmt_dir = TALEND_QTCMT_ROOT
+    qtcmt_dir.mkdir(parents=True, exist_ok=True)
 
-    dest = tenant_dir / "qtcmt.mv.db"
+    dest = qtcmt_dir / "qtcmt.mv.db"
     _save_upload(file, dest)
+
     return str(dest)
+
 
 # ============================================================
 #  Talend Job Runner (run_artifact.py) + Persistence
 # ============================================================
 
 async def run_talend_job(
-    artifact_name: str,
     account_id: str,
     tenant_id: str,
     staged_cseat: List[str],
@@ -223,6 +250,7 @@ async def run_talend_job(
           --artifact QTCMT_uploadAssetsData
           --account-id <id>
           --tenant-id <id>
+          --input database_path=/qtcmt
           --input tmp_folder=/tmp/CS_AUTO
           --timeout <TALEND_TIMEOUT_SECONDS>
 
@@ -246,18 +274,18 @@ async def run_talend_job(
             "status": "error",
             "exit_code": -1,
             "stdout": "",
-            "stderr": "No artifacts provided. Upload at least one CSEAT CSV or a QTCMT H2 file before running.",
+            "stderr": (
+                "No artifacts provided. Upload at least one CSEAT CSV or a "
+                "QTCMT H2 file before running the Talend job."
+            ),
             "command": [],
-            "run_mode": RUN_MODE,
-            "runner": RUN_MODULE if RUN_MODE == "module" else str(RUN_ARTIFACT_PATH),
+            "runner_path": str(RUN_ARTIFACT_PATH),
             "config_path": str(CONFIG_PATH),
+            "database_path_arg": DB_PATH_ARG,
             "tmp_folder_arg": TMP_FOLDER_ARG,
-            "staging_tmp_root": str(TALEND_TMP_ROOT),
-            "staged_cseat": staged_cseat,
-            "staged_qtcmt": staged_qtcmt,
             "run_id": None,
         }
-    
+
     runner_info = _resolve_runner()
     cfg_info = _resolve_config()
 
@@ -268,64 +296,46 @@ async def run_talend_job(
             "stdout": "",
             "stderr": (
                 "Talend runner not found. "
-                f"Tried: {', '.join(runner_info.get('tried', []))}. "
-                "Ensure app/talend_orchestration/run_artifact.py is present (module mode), "
-                "or set TALEND_RUN_MODE=script + TALEND_RUN_ARTIFACT_PATH."
+                f"Tried: {', '.join(runner_info['tried'])}. "
+                "Set TALEND_RUN_ARTIFACT_PATH to the full path of run_artifact.py."
             ),
             "command": [],
-            "run_mode": RUN_MODE,
-            "runner": RUN_MODULE if RUN_MODE == "module" else str(RUN_ARTIFACT_PATH),
+            "runner_path": str(RUN_ARTIFACT_PATH),
             "config_path": str(cfg_info["path"]),
+            "database_path_arg": DB_PATH_ARG,
             "tmp_folder_arg": TMP_FOLDER_ARG,
-            "staging_tmp_root": str(TALEND_TMP_ROOT),
-            "staged_cseat": staged_cseat,
-            "staged_qtcmt": staged_qtcmt,
             "run_id": None,
         }
-    
+
+    runner_path: Path = runner_info["path"]
+    config_path: Path = cfg_info["path"]
+
     config_warning = ""
     if not cfg_info["exists"]:
         config_warning = (
-            f"Warning: config file not found at {cfg_info['path']}. "
+            f"Warning: config file not found at {config_path}. "
             "The Talend runner may fail if it requires this file.\n"
         )
 
-    # Build command aligned to your current CLI contract
-    if RUN_MODE == "module":
-        cmd: List[str] = [
-            PYTHON_BIN,
-            "-m",
-            RUN_MODULE,
-            "--config",
-            str(cfg_info["path"]),
-            "--artifact",
-            artifact_name,
-            "--account-id",
-            account_id,
-            "--tenant-id",
-            tenant_id,
-            "--input",
-            f"tmp_folder={TMP_FOLDER_ARG}",
-            "--timeout",
-            str(TIMEOUT_SECONDS),
-        ]
-    else:
-        cmd = [
-            PYTHON_BIN,
-            str(runner_info["path"]),
-            "--config",
-            str(cfg_info["path"]),
-            "--artifact",
-            artifact_name,
-            "--account-id",
-            account_id,
-            "--tenant-id",
-            tenant_id,
-            "--input",
-            f"tmp_folder={TMP_FOLDER_ARG}",
-            "--timeout",
-            str(TIMEOUT_SECONDS),
-        ]
+    # Build command matching your reference CLI
+    cmd: List[str] = [
+        PYTHON_BIN,
+        str(runner_path),
+        "--config",
+        str(config_path),
+        "--artifact",
+        ARTIFACT_NAME,
+        "--account-id",
+        account_id,
+        "--tenant-id",
+        tenant_id,
+        "--input",
+        f"database_path={DB_PATH_ARG}",
+        "--input",
+        f"tmp_folder={TMP_FOLDER_ARG}",
+        "--timeout",
+        str(TIMEOUT_SECONDS),
+    ]
 
     env = _build_talend_env()
 
@@ -347,7 +357,7 @@ async def run_talend_job(
         async with connection() as conn:
             cur = await conn.execute(
                 insert_sql,
-                (account_id, tenant_id, account_name, artifact_name),
+                (account_id, tenant_id, account_name, ARTIFACT_NAME),
             )
             row = await cur.fetchone()
             if row:
@@ -366,7 +376,6 @@ async def run_talend_job(
                 stderr=subprocess.PIPE,
                 env=env,
                 text=True,
-                cwd=str(PROJECT_DIR),   # importnat for module imports in Docker (/app)
             )
 
         completed: subprocess.CompletedProcess = await loop.run_in_executor(
@@ -387,13 +396,10 @@ async def run_talend_job(
             "stdout": stdout_text,
             "stderr": stderr_text,
             "command": cmd,
-            "run_mode": RUN_MODE,
-            "runner": RUN_MODULE if RUN_MODE == "module" else str(runner_info["path"]),
-            "config_path": str(cfg_info["path"]),
+            "runner_path": str(runner_path),
+            "config_path": str(config_path),
+            "database_path_arg": DB_PATH_ARG,
             "tmp_folder_arg": TMP_FOLDER_ARG,
-            "staging_tmp_root": str(TALEND_TMP_ROOT),
-            "staged_cseat": staged_cseat,
-            "staged_qtcmt": staged_qtcmt,
             "run_id": run_id,
         }
 
@@ -422,7 +428,6 @@ async def run_talend_job(
 
         return result
 
-    
     except Exception as e:
         error_result: Dict[str, Any] = {
             "status": "error",
@@ -430,13 +435,10 @@ async def run_talend_job(
             "stdout": "",
             "stderr": f"Exception launching Talend runner: {repr(e)}",
             "command": cmd,
-            "run_mode": RUN_MODE,
-            "runner": RUN_MODULE if RUN_MODE == "module" else str(runner_info.get("path", RUN_ARTIFACT_PATH)),
-            "config_path": str(cfg_info["path"]),
+            "runner_path": str(runner_path),
+            "config_path": str(config_path),
+            "database_path_arg": DB_PATH_ARG,
             "tmp_folder_arg": TMP_FOLDER_ARG,
-            "staging_tmp_root": str(TALEND_TMP_ROOT),
-            "staged_cseat": staged_cseat,
-            "staged_qtcmt": staged_qtcmt,
             "run_id": run_id,
         }
 
@@ -481,47 +483,9 @@ async def process_talend_run_request(
     staged_cseat = await stage_cseat_files(account_id, tenant_id, cseat_files)
     staged_qtcmt = await stage_qtcmt_file(account_id, tenant_id, qtcmt_file)
 
-    runs: list[dict] = []
-
-    # Run CSEAT artifact if we have CSEAT files
-    if staged_cseat:
-        runs.append(
-            await run_talend_job(
-                artifact_name=ARTIFACT_CSEAT,
-                account_id=account_id,
-                tenant_id=tenant_id,
-                staged_cseat=staged_cseat,
-                staged_qtcmt=staged_qtcmt,  # safe to pass; runner can ignore inputs it doesn't use
-            )
-        )
-
-    # Run QTCMT artifact if we have QTCMT file
-    if staged_qtcmt:
-        runs.append(
-            await run_talend_job(
-                artifact_name=ARTIFACT_QTCMT,
-                account_id=account_id,
-                tenant_id=tenant_id,
-                staged_cseat=staged_cseat,
-                staged_qtcmt=staged_qtcmt,
-            )
-        )
-
-    if not runs:
-        return {
-            "status": "error",
-            "message": "No artifacts provided. Upload at least one CSEAT CSV or a QTCMT H2 file.",
-            "runs": [],
-            "account_id": account_id,
-            "tenant_id": tenant_id,
-        }
-
-    overall_status = "success" if all(r.get("status") == "success" for r in runs) else "error"
-    return {
-        "status": overall_status,
-        "runs": runs,
-        "account_id": account_id,
-        "tenant_id": tenant_id,
-        "staged_cseat": staged_cseat,
-        "staged_qtcmt": staged_qtcmt,
-    }    
+    return await run_talend_job(
+        account_id=account_id,
+        tenant_id=tenant_id,
+        staged_cseat=staged_cseat,
+        staged_qtcmt=staged_qtcmt,
+    )
