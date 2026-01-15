@@ -1,9 +1,7 @@
 import type { KeyboardEvent } from "react";
-import { memo, useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import QlikSenseTab from "./QlikSenseTab"; // <- keep side-by-side with this file
 import TalendTab from "./TalendTab"; // <- new Talend tab
-import { InsightsChip } from "./InsightsChip";
-import { InsightsModal } from "./InsightsModal";
 
 /** Types */
 type Customer = { customer_id: number; customer_name: string };
@@ -191,436 +189,6 @@ function LoaderOverlay({
   );
 }
 
-
-
-/* =========================
-   ENTERPRISE-STABLE UPLOAD CARDS
-   (Module-scope + memoized to avoid file-input remount/reset)
-   ========================= */
-
-type UploadCardProps = {
-  title: string;
-  icon: string;
-  description: string;
-  fileRef: { current: HTMLInputElement | null };
-  accept: string;
-  onUpload: () => void;
-  phase: Phase;
-  pct?: number | null;
-  customerSelected: boolean;
-};
-
-const UploadCard = memo(function UploadCard({
-  title,
-  icon,
-  description,
-  fileRef,
-  accept,
-  onUpload,
-  phase,
-  pct,
-  customerSelected,
-}: UploadCardProps) {
-  const [fileName, setFileName] = useState("");
-  const [isDragging, setIsDragging] = useState(false);
-
-  return (
-    <div
-      className={`relative bg-white border rounded p-6 transition-all ${
-        isDragging ? "border-green-500 border-2 shadow-lg" : "border-gray-200 hover:border-gray-300"
-      }`}
-      onDragOver={(e) => {
-        e.preventDefault();
-        setIsDragging(true);
-      }}
-      onDragLeave={() => setIsDragging(false)}
-      onDrop={(e) => {
-        e.preventDefault();
-        setIsDragging(false);
-        const file = e.dataTransfer.files?.[0];
-        if (file && fileRef.current) {
-          const dt = new DataTransfer();
-          dt.items.add(file);
-          fileRef.current.files = dt.files;
-          setFileName(file.name);
-        }
-      }}
-    >
-      <div className="flex items-start gap-4 mb-4">
-        <div className="h-12 w-12 rounded bg-gray-100 grid place-items-center text-2xl flex-shrink-0">{icon}</div>
-        <div className="flex-1 min-w-0">
-          <h3 className="text-base font-semibold text-gray-900 mb-1">{title}</h3>
-          <p className="text-sm text-gray-600">{description}</p>
-        </div>
-      </div>
-
-      <div className="space-y-3">
-        <input
-          ref={fileRef}
-          type="file"
-          className="hidden"
-          accept={accept}
-          onChange={(e) => setFileName(e.target.files?.[0]?.name || "")}
-        />
-
-        <button
-          type="button"
-          onClick={() => fileRef.current?.click()}
-          className="w-full rounded border border-gray-300 bg-white hover:bg-gray-50 px-4 h-10 text-sm text-gray-700 font-medium transition-colors"
-        >
-          {fileName ? `✓ ${fileName}` : "Choose File"}
-        </button>
-
-        <button
-          type="button"
-          onClick={onUpload}
-          disabled={!customerSelected || phase === "uploading" || phase === "processing"}
-          className="w-full rounded bg-green-600 hover:bg-green-700 disabled:bg-gray-300 disabled:cursor-not-allowed px-4 h-10 text-sm text-white font-semibold transition-colors"
-        >
-          {phase === "uploading" || phase === "processing" ? "Processing…" : "Upload & Process"}
-        </button>
-
-        {phase !== "idle" && (
-          <div className="rounded bg-gray-50 border border-gray-200 p-3 space-y-2">
-            {phase === "uploading" && (
-              <>
-                <div className="text-xs text-gray-700 font-medium">Uploading… {pct ?? 0}%</div>
-                <div className="h-2 rounded-full bg-gray-200 overflow-hidden">
-                  <div className="h-full bg-green-600 transition-all" style={{ width: `${pct ?? 0}%` }} />
-                </div>
-              </>
-            )}
-            {phase === "processing" && (
-              <>
-                <div className="text-xs text-gray-700 font-medium">Processing on server…</div>
-                <div className="h-2 rounded-full bg-gray-200 overflow-hidden">
-                  <div className="h-full w-2/3 animate-progress-bar bg-green-600" />
-                </div>
-              </>
-            )}
-            {phase === "done" && <div className="text-xs text-green-700 font-medium">Completed ✓</div>}
-            {phase === "error" && <div className="text-xs text-red-700 font-medium">Failed. See toast for details.</div>}
-          </div>
-        )}
-      </div>
-    </div>
-  );
-});
-
-type RepositoryUploadCardProps = {
-  customerSelected: boolean;
-  repoFileRef: { current: HTMLInputElement | null };
-  repoPhase: Phase;
-  repoPct: number | null;
-  repoTotal: number | null;
-  repoItems: Record<string, RepoFileItem>;
-  onUpload: () => void;
-  onStopStream: () => void;
-  getInsightsStatusForRunId?: (runId: number) => string | null | undefined;
-  onOpenInsightsForRun?: (runId: number) => void;
-};
-
-const RepositoryUploadCard = memo(function RepositoryUploadCard({
-  customerSelected,
-  repoFileRef,
-  repoPhase,
-  repoPct,
-  repoTotal,
-  repoItems,
-  onUpload,
-  onStopStream,
-  getInsightsStatusForRunId,
-  onOpenInsightsForRun,
-}: RepositoryUploadCardProps) {
-  const [fileName, setFileName] = useState("");
-  const [isDragging, setIsDragging] = useState(false);
-
-  const items = Object.values(repoItems).sort((a, b) => {
-    const ai = a.index ?? 0;
-    const bi = b.index ?? 0;
-    return ai - bi || a.fileName.localeCompare(b.fileName);
-  });
-
-  const total = repoTotal ?? (fileName ? 1 : 0);
-  const doneCount = items.filter((i) => i.status === "done").length;
-  const errCount = items.filter((i) => i.status === "error").length;
-
-  return (
-    <div
-      className={`relative bg-white border rounded p-6 transition-all ${
-        isDragging ? "border-green-500 border-2 shadow-lg" : "border-gray-200 hover:border-gray-300"
-      }`}
-      onDragOver={(e) => {
-        e.preventDefault();
-        setIsDragging(true);
-      }}
-      onDragLeave={() => setIsDragging(false)}
-      onDrop={(e) => {
-        e.preventDefault();
-        setIsDragging(false);
-        const file = e.dataTransfer.files?.[0];
-        if (file && repoFileRef.current) {
-          const dt = new DataTransfer();
-          dt.items.add(file);
-          repoFileRef.current.files = dt.files;
-          setFileName(file.name);
-        }
-      }}
-    >
-      <div className="flex items-start gap-4 mb-4">
-        <div className="h-12 w-12 rounded bg-gray-100 grid place-items-center text-2xl flex-shrink-0">📋</div>
-        <div className="flex-1 min-w-0">
-          <h3 className="text-base font-semibold text-gray-900 mb-1">Repository JSON / ZIP</h3>
-          <p className="text-sm text-gray-600">
-            Upload a single repository <span className="font-medium">JSON</span> or a <span className="font-medium">ZIP</span>
-            containing multiple JSONs (one per Replicate server). We’ll unpack, ingest each, and stream per-server status.
-          </p>
-        </div>
-      </div>
-
-      <div className="space-y-3">
-        <input
-          ref={repoFileRef}
-          type="file"
-          className="hidden"
-          accept=".json,.zip"
-          onChange={(e) => setFileName(e.target.files?.[0]?.name || "")}
-        />
-
-        <button
-          type="button"
-          onClick={() => repoFileRef.current?.click()}
-          className="w-full rounded border border-gray-300 bg-white hover:bg-gray-50 px-4 h-10 text-sm text-gray-700 font-medium transition-colors"
-        >
-          {fileName ? `✓ ${fileName}` : "Choose JSON or ZIP"}
-        </button>
-
-        <div className="flex gap-3">
-          <button
-            type="button"
-            onClick={onUpload}
-            disabled={!customerSelected || repoPhase === "uploading" || repoPhase === "processing"}
-            className="flex-1 rounded bg-green-600 hover:bg-green-700 disabled:bg-gray-300 disabled:cursor-not-allowed px-4 h-10 text-sm text-white font-semibold transition-colors"
-          >
-            {repoPhase === "uploading" || repoPhase === "processing" ? "Processing…" : "Upload & Process"}
-          </button>
-
-          <button
-            type="button"
-            onClick={onStopStream}
-            disabled={repoPhase !== "processing"}
-            className="flex-1 rounded border border-gray-300 bg-white hover:bg-gray-50 disabled:bg-gray-100 disabled:text-gray-400 disabled:cursor-not-allowed px-4 h-10 text-sm text-gray-700 font-semibold transition-colors"
-          >
-            Stop Stream
-          </button>
-        </div>
-
-        {repoPhase !== "idle" && (
-          <div className="rounded bg-gray-50 border border-gray-200 p-3 space-y-2">
-            {repoPhase === "uploading" && (
-              <>
-                <div className="text-xs text-gray-700 font-medium">Uploading… {repoPct ?? 0}%</div>
-                <div className="h-2 rounded-full bg-gray-200 overflow-hidden">
-                  <div className="h-full bg-green-600 transition-all" style={{ width: `${repoPct ?? 0}%` }} />
-                </div>
-              </>
-            )}
-            {repoPhase === "processing" && (
-              <>
-                <div className="text-xs text-gray-700 font-medium">Streaming ingest status…</div>
-                <div className="h-2 rounded-full bg-gray-200 overflow-hidden">
-                  <div className="h-full w-2/3 animate-progress-bar bg-green-600" />
-                </div>
-              </>
-            )}
-            {repoPhase === "done" && (
-              <div className="text-xs text-green-700 font-medium">
-                Completed ✓ ({doneCount}/{total} succeeded{errCount ? `, ${errCount} failed` : ""})
-              </div>
-            )}
-            {repoPhase === "error" && <div className="text-xs text-red-700 font-medium">Failed. See toast for details.</div>}
-          </div>
-        )}
-
-        {items.length > 0 && (
-          <div className="rounded border border-gray-200 bg-white">
-            <div className="px-3 py-2 text-xs font-semibold text-gray-600 uppercase tracking-wide border-b">
-              Ingestion timeline
-            </div>
-            <div className="max-h-64 overflow-auto divide-y divide-gray-100">
-              {items.map((it) => {
-                const status = typeof it.runId === "number" && getInsightsStatusForRunId ? getInsightsStatusForRunId(it.runId) : null;
-                return (
-                  <div key={it.fileName} className="px-3 py-2 text-sm flex items-center justify-between gap-3">
-                    <div className="min-w-0">
-                      <div className="flex items-center gap-2">
-                        <span
-                          className={`inline-flex h-5 w-5 items-center justify-center rounded-full text-xs ${
-                            it.status === "done"
-                              ? "bg-green-600 text-white"
-                              : it.status === "error"
-                              ? "bg-red-600 text-white"
-                              : it.status === "processing"
-                              ? "bg-blue-600 text-white animate-pulse"
-                              : "bg-gray-300 text-gray-700"
-                          }`}
-                          title={it.status}
-                        >
-                          {it.status === "done" ? "✓" : it.status === "error" ? "!" : it.index ?? "…"}
-                        </span>
-                        <span className="font-medium text-gray-900 truncate">{it.serverName ?? "…"}</span>
-                        <span className="text-gray-500 truncate">({it.fileName})</span>
-                      </div>
-                      {it.status === "done" && (
-                        <div className="text-xs text-gray-600 ml-7">
-                          run {it.runId ?? "—"} · endpoints {it.endpoints ?? 0} · tasks {it.tasks ?? 0}
-                        </div>
-                      )}
-                      {it.status === "error" && it.message && <div className="text-xs text-red-700 ml-7">{it.message}</div>}
-                    </div>
-
-                    {typeof it.runId === "number" && onOpenInsightsForRun && (
-                      <div className="flex-shrink-0">
-                        <InsightsChip
-                          status={status ?? (it.status === "done" ? "created" : null)}
-                          onClick={() => onOpenInsightsForRun(it.runId!)}
-                        />
-                      </div>
-                    )}
-                  </div>
-                );
-              })}
-            </div>
-          </div>
-        )}
-      </div>
-    </div>
-  );
-});
-
-type MetricsLogCardProps = {
-  customerSelected: boolean;
-  servers: { server_id: number; server_name: string }[];
-  metricsServerName: string;
-  setMetricsServerName: (v: string) => void;
-  metricsFileRef: { current: HTMLInputElement | null };
-  onUpload: () => void;
-  metricsPhase: Phase;
-  metricsUploadPct?: number | null;
-};
-
-const MetricsLogCard = memo(function MetricsLogCard({
-  customerSelected,
-  servers,
-  metricsServerName,
-  setMetricsServerName,
-  metricsFileRef,
-  onUpload,
-  metricsPhase,
-  metricsUploadPct,
-}: MetricsLogCardProps) {
-  const [fileName, setFileName] = useState("");
-  const [isDragging, setIsDragging] = useState(false);
-
-  return (
-    <div
-      className={`relative bg-white border rounded p-6 transition-all ${
-        isDragging ? "border-green-500 border-2 shadow-lg" : "border-gray-200 hover:border-gray-300"
-      }`}
-      onDragOver={(e) => {
-        e.preventDefault();
-        setIsDragging(true);
-      }}
-      onDragLeave={() => setIsDragging(false)}
-      onDrop={(e) => {
-        e.preventDefault();
-        setIsDragging(false);
-        const file = e.dataTransfer.files?.[0];
-        if (file && metricsFileRef.current) {
-          const dt = new DataTransfer();
-          dt.items.add(file);
-          metricsFileRef.current.files = dt.files;
-          setFileName(file.name);
-        }
-      }}
-    >
-      <div className="flex items-start gap-4 mb-4">
-        <div className="h-12 w-12 rounded bg-gray-100 grid place-items-center text-2xl flex-shrink-0">📈</div>
-        <div className="flex-1 min-w-0">
-          <h3 className="text-base font-semibold text-gray-900 mb-1">Metrics Log (TSV)</h3>
-          <p className="text-sm text-gray-600">
-            Per-Replicate server metrics; matched by <code className="text-xs bg-gray-100 px-1 py-0.5 rounded">taskID</code>
-            (Task UUID).
-          </p>
-        </div>
-      </div>
-
-      <div className="space-y-3">
-        <select
-          className="w-full rounded border border-gray-300 bg-white px-3 h-10 text-sm text-gray-700 focus:outline-none focus:ring-2 focus:ring-green-500 focus:border-transparent"
-          value={metricsServerName}
-          onChange={(e) => setMetricsServerName(e.target.value)}
-        >
-          <option value="">Select server…</option>
-          {servers.map((s) => (
-            <option key={s.server_id} value={s.server_name}>
-              {s.server_name}
-            </option>
-          ))}
-        </select>
-
-        <input
-          ref={metricsFileRef}
-          type="file"
-          className="hidden"
-          accept=".tsv,.txt"
-          onChange={(e) => setFileName(e.target.files?.[0]?.name || "")}
-        />
-
-        <button
-          type="button"
-          onClick={() => metricsFileRef.current?.click()}
-          className="w-full rounded border border-gray-300 bg-white hover:bg-gray-50 px-4 h-10 text-sm text-gray-700 font-medium transition-colors"
-        >
-          {fileName ? `✓ ${fileName}` : "Choose File"}
-        </button>
-
-        <button
-          type="button"
-          onClick={onUpload}
-          disabled={!customerSelected || !metricsServerName || metricsPhase === "uploading" || metricsPhase === "processing"}
-          className="w-full rounded bg-green-600 hover:bg-green-700 disabled:bg-gray-300 disabled:cursor-not-allowed px-4 h-10 text-sm text-white font-semibold transition-colors"
-        >
-          {metricsPhase === "uploading" || metricsPhase === "processing" ? "Processing…" : "Upload & Process"}
-        </button>
-
-        {metricsPhase !== "idle" && (
-          <div className="rounded bg-gray-50 border border-gray-200 p-3 space-y-2">
-            {metricsPhase === "uploading" && (
-              <>
-                <div className="text-xs text-gray-700 font-medium">Uploading… {metricsUploadPct ?? 0}%</div>
-                <div className="h-2 rounded-full bg-gray-200 overflow-hidden">
-                  <div className="h-full bg-green-600 transition-all" style={{ width: `${metricsUploadPct ?? 0}%` }} />
-                </div>
-              </>
-            )}
-            {metricsPhase === "processing" && (
-              <>
-                <div className="text-xs text-gray-700 font-medium">Processing on server…</div>
-                <div className="h-2 rounded-full bg-gray-200 overflow-hidden">
-                  <div className="h-full w-2/3 animate-progress-bar bg-green-600" />
-                </div>
-              </>
-            )}
-            {metricsPhase === "done" && <div className="text-xs text-green-700 font-medium">Completed ✓</div>}
-            {metricsPhase === "error" && <div className="text-xs text-red-700 font-medium">Failed. See toast for details.</div>}
-          </div>
-        )}
-      </div>
-    </div>
-  );
-});
-
 /* =========================
    REPLICATE TAB (original)
    ========================= */
@@ -680,138 +248,6 @@ function ReplicateTab() {
   const [repoFailed, setRepoFailed] = useState<number>(0);
   const [repoItems, setRepoItems] = useState<Record<string, RepoFileItem>>({});
   const repoEsRef = useRef<EventSource | null>(null);
-
-
-  // =========================
-  // AI Insights (Phase 1)
-  // =========================
-  const [insightsOpen, setInsightsOpen] = useState(false);
-  const [insightsRunId, setInsightsRunId] = useState<number | null>(null);
-  const [insightsLoading, setInsightsLoading] = useState(false);
-  const [insightsByRunId, setInsightsByRunId] = useState<Record<number, any>>({});
-  const insightsByRunIdRef = useRef<Record<number, any>>({});
-
-  useEffect(() => {
-    insightsByRunIdRef.current = insightsByRunId;
-  }, [insightsByRunId]);
-
-  const insightRunOptions = useMemo(() => {
-    return Object.values(repoItems)
-      .filter((it) => it.status === "done" && typeof it.runId === "number")
-      .map((it) => ({
-        runId: it.runId as number,
-        label: `${(it.serverName || it.fileName).slice(0, 24)} (run ${it.runId})`,
-      }))
-      .sort((a, b) => b.runId - a.runId);
-  }, [repoItems]);
-
-  useEffect(() => {
-    if (!insightsRunId && insightRunOptions.length > 0) {
-      setInsightsRunId(insightRunOptions[0].runId);
-    }
-  }, [insightsRunId, insightRunOptions]);
-
-  function getInsightsStatus(runId: number): string | null {
-    const r = insightsByRunIdRef.current[runId];
-    return (r?.job?.status as string) ?? null;
-  }
-
-  async function fetchInsights(runId: number) {
-    const res = await fetch(`${API_BASE}/api/runs/${runId}/insights`);
-    if (!res.ok) {
-      // If not found yet, treat as not started.
-      return { job: { status: "created" }, result: null, automation: null };
-    }
-    return await res.json();
-  }
-
-  async function refreshInsights(runId: number) {
-    const data = await fetchInsights(runId);
-    // Only update state if something material changed (prevents rerender churn)
-    setInsightsByRunId((prev) => {
-      const before = prev[runId];
-      const sigBefore = JSON.stringify({
-        s: before?.job?.status,
-        u: before?.job?.updated_at,
-        a: before?.automation?.execution_id,
-        as: before?.automation?.status,
-      });
-      const sigAfter = JSON.stringify({
-        s: data?.job?.status,
-        u: data?.job?.updated_at,
-        a: data?.automation?.execution_id,
-        as: data?.automation?.status,
-      });
-      if (sigBefore === sigAfter) return prev;
-      return { ...prev, [runId]: data };
-    });
-    return data;
-  }
-
-  async function startInsights(runId: number) {
-    setInsightsLoading(true);
-    try {
-      const res = await fetch(`${API_BASE}/api/runs/${runId}/insights/start`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ requested_by: "ui" }),
-      });
-      if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
-      await refreshInsights(runId);
-      toast("AI insights started.", "ok");
-    } catch (e: any) {
-      toast(`Start insights failed: ${e.message}`, "err");
-    } finally {
-      setInsightsLoading(false);
-    }
-  }
-
-  async function retryInsights(runId: number) {
-    setInsightsLoading(true);
-    try {
-      const res = await fetch(`${API_BASE}/api/runs/${runId}/insights/retry`, { method: "POST" });
-      if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
-      await refreshInsights(runId);
-      toast("AI insights retry requested.", "ok");
-    } catch (e: any) {
-      toast(`Retry insights failed: ${e.message}`, "err");
-    } finally {
-      setInsightsLoading(false);
-    }
-  }
-
-  function openInsights(runId: number) {
-    setInsightsRunId(runId);
-    setInsightsOpen(true);
-    void refreshInsights(runId);
-  }
-
-  // Controlled polling: only while modal is open OR job is pending/running
-  useEffect(() => {
-    let timer: any = null;
-    let cancelled = false;
-
-    async function tick() {
-      if (!insightsRunId) return;
-      const status = getInsightsStatus(insightsRunId) || "created";
-      const shouldPoll = insightsOpen || status === "pending" || status === "running";
-      if (!shouldPoll) return;
-
-      const intervalMs = insightsOpen ? 2500 : 7000;
-      try {
-        await refreshInsights(insightsRunId);
-      } catch {
-        // ignore
-      }
-      if (!cancelled) timer = setTimeout(tick, intervalMs);
-    }
-
-    void tick();
-    return () => {
-      cancelled = true;
-      if (timer) clearTimeout(timer);
-    };
-  }, [insightsRunId, insightsOpen]);
 
   const [qemServersPhase, setQemServersPhase] = useState<Phase>("idle");
   const [qemServersPct, setQemServersPct] = useState<number | null>(null);
@@ -1105,11 +541,6 @@ function ReplicateTab() {
               endpoints: (payload as any).endpoints,
               tasks: (payload as any).tasks,
             });
-            const rid = (payload as any).runId as any;
-            if (typeof rid === "number") {
-              // Prefetch once so chips/status are available without polling storms
-              void refreshInsights(rid);
-            }
           }
 
           if (t === "error") {
@@ -1406,7 +837,369 @@ function ReplicateTab() {
     }
   }
 
-  // (metrics log card moved to module scope)
+  // Upload card component (generic)
+  function UploadCard({ title, icon, description, fileRef, accept, onUpload, phase, pct }: any) {
+    const [fileName, setFileName] = useState("");
+    const [isDragging, setIsDragging] = useState(false);
+
+    return (
+      <div
+        className={`relative bg-white border rounded p-6 transition-all ${
+          isDragging ? "border-green-500 border-2 shadow-lg" : "border-gray-200 hover:border-gray-300"
+        }`}
+        onDragOver={(e) => {
+          e.preventDefault();
+          setIsDragging(true);
+        }}
+        onDragLeave={() => setIsDragging(false)}
+        onDrop={(e) => {
+          e.preventDefault();
+          setIsDragging(false);
+          const file = e.dataTransfer.files[0];
+          if (file && fileRef.current) {
+            const dt = new DataTransfer();
+            dt.items.add(file);
+            fileRef.current.files = dt.files;
+            setFileName(file.name);
+          }
+        }}
+      >
+        <div className="flex items-start gap-4 mb-4">
+          <div className="h-12 w-12 rounded bg-gray-100 grid place-items-center text-2xl flex-shrink-0">{icon}</div>
+          <div className="flex-1 min-w-0">
+            <h3 className="text-base font-semibold text-gray-900 mb-1">{title}</h3>
+            <p className="text-sm text-gray-600">{description}</p>
+          </div>
+        </div>
+
+        <div className="space-y-3">
+          <input
+            ref={fileRef}
+            type="file"
+            className="hidden"
+            accept={accept}
+            onChange={(e) => setFileName(e.target.files?.[0]?.name || "")}
+          />
+
+          <button
+            onClick={() => fileRef.current?.click()}
+            className="w-full rounded border border-gray-300 bg-white hover:bg-gray-50 px-4 h-10 text-sm text-gray-700 font-medium transition-colors"
+          >
+            {fileName ? `✓ ${fileName}` : "Choose File"}
+          </button>
+
+          <button
+            onClick={onUpload}
+            disabled={!customerName || busy || phase === "uploading" || phase === "processing"}
+            className="w-full rounded bg-green-600 hover:bg-green-700 disabled:bg-gray-300 disabled:cursor-not-allowed px-4 h-10 text-sm text-white font-semibold transition-colors"
+          >
+            {phase === "uploading" || phase === "processing" ? "Processing…" : "Upload & Process"}
+          </button>
+
+          {phase !== "idle" && (
+            <div className="rounded bg-gray-50 border border-gray-200 p-3 space-y-2">
+              {phase === "uploading" && (
+                <>
+                  <div className="text-xs text-gray-700 font-medium">Uploading… {pct ?? 0}%</div>
+                  <div className="h-2 rounded-full bg-gray-200 overflow-hidden">
+                    <div className="h-full bg-green-600 transition-all" style={{ width: `${pct ?? 0}%` }} />
+                  </div>
+                </>
+              )}
+              {phase === "processing" && (
+                <>
+                  <div className="text-xs text-gray-700 font-medium">Processing on server…</div>
+                  <div className="h-2 rounded-full bg-gray-200 overflow-hidden">
+                    <div className="h-full w-2/3 animate-progress-bar bg-green-600" />
+                  </div>
+                </>
+              )}
+              {phase === "done" && <div className="text-xs text-green-700 font-medium">Completed ✓</div>}
+              {phase === "error" && <div className="text-xs text-red-700 font-medium">Failed. See toast for details.</div>}
+            </div>
+          )}
+        </div>
+      </div>
+    );
+  }
+
+  // Specialized Repository JSON/ZIP card w/ SSE timeline
+  function RepositoryUploadCard() {
+    const [fileName, setFileName] = useState("");
+    const [isDragging, setIsDragging] = useState(false);
+
+    const items = Object.values(repoItems).sort((a, b) => {
+      const ai = a.index ?? 0;
+      const bi = b.index ?? 0;
+      return ai - bi || a.fileName.localeCompare(b.fileName);
+    });
+
+    const total = repoTotal ?? (fileName ? 1 : 0);
+    const doneCount = items.filter((i) => i.status === "done").length;
+    const errCount = items.filter((i) => i.status === "error").length;
+
+    return (
+      <div
+        className={`relative bg-white border rounded p-6 transition-all ${
+          isDragging ? "border-green-500 border-2 shadow-lg" : "border-gray-200 hover:border-gray-300"
+        }`}
+        onDragOver={(e) => {
+          e.preventDefault();
+          setIsDragging(true);
+        }}
+        onDragLeave={() => setIsDragging(false)}
+        onDrop={(e) => {
+          e.preventDefault();
+          setIsDragging(false);
+          const file = e.dataTransfer.files[0];
+          if (file && repoFileRef.current) {
+            const dt = new DataTransfer();
+            dt.items.add(file);
+            repoFileRef.current.files = dt.files;
+            setFileName(file.name);
+          }
+        }}
+      >
+        <div className="flex items-start gap-4 mb-4">
+          <div className="h-12 w-12 rounded bg-gray-100 grid place-items-center text-2xl flex-shrink-0">📋</div>
+          <div className="flex-1 min-w-0">
+            <h3 className="text-base font-semibold text-gray-900 mb-1">Repository JSON / ZIP</h3>
+            <p className="text-sm text-gray-600">
+              Upload a single repository <span className="font-medium">JSON</span> or a{" "}
+              <span className="font-medium">ZIP</span> containing multiple JSONs (one per Replicate server). We’ll
+              unpack, ingest each, and stream per-server status.
+            </p>
+          </div>
+        </div>
+
+        <div className="space-y-3">
+          <input
+            ref={repoFileRef}
+            type="file"
+            className="hidden"
+            accept=".json,.zip"
+            onChange={(e) => setFileName(e.target.files?.[0]?.name || "")}
+          />
+
+          <button
+            onClick={() => repoFileRef.current?.click()}
+            className="w-full rounded border border-gray-300 bg-white hover:bg-gray-50 px-4 h-10 text-sm text-gray-700 font-medium transition-colors"
+          >
+            {fileName ? `✓ ${fileName}` : "Choose JSON or ZIP"}
+          </button>
+
+          <div className="grid grid-cols-2 gap-2">
+            <button
+              onClick={handleUploadRepoJsonOrZip}
+              disabled={!customerName || busy || repoPhase === "uploading" || repoPhase === "processing"}
+              className="rounded bg-green-600 hover:bg-green-700 disabled:bg-gray-300 disabled:cursor-not-allowed px-4 h-10 text-sm text-white font-semibold transition-colors"
+            >
+              {repoPhase === "uploading" || repoPhase === "processing" ? "Processing…" : "Upload & Process"}
+            </button>
+            {repoJobId && (repoPhase === "processing" || repoPhase === "done") && (
+              <button
+                onClick={clearRepoSse}
+                className="rounded border border-gray-300 bg-white hover:bg-gray-50 px-4 h-10 text-sm text-gray-700 font-medium transition-colors"
+                title="Stop listening to stream (does not cancel backend job)"
+              >
+                Stop Stream
+              </button>
+            )}
+          </div>
+
+          {repoPhase !== "idle" && (
+            <div className="rounded bg-gray-50 border border-gray-200 p-3 space-y-2">
+              {repoPhase === "uploading" && (
+                <>
+                  <div className="text-xs text-gray-700 font-medium">Uploading… {repoPct ?? 0}%</div>
+                  <div className="h-2 rounded-full bg-gray-200 overflow-hidden">
+                    <div className="h-full bg-green-600 transition-all" style={{ width: `${repoPct ?? 0}%` }} />
+                  </div>
+                </>
+              )}
+              {repoPhase === "processing" && (
+                <>
+                  <div className="flex items-center justify-between">
+                    <div className="text-xs text-gray-700 font-medium">
+                      Processing on server…{" "}
+                      {total ? (
+                        <span className="text-gray-600">
+                          ({doneCount + errCount}/{total} completed)
+                        </span>
+                      ) : null}
+                    </div>
+                    {(repoSuccess > 0 || repoFailed > 0) && (
+                      <div className="text-xs text-gray-700">
+                        <span className="text-green-700 font-medium">{repoSuccess} ok</span>{" "}
+                        {repoFailed > 0 && (
+                          <span className="text-red-700 font-medium">· {repoFailed} failed</span>
+                        )}
+                      </div>
+                    )}
+                  </div>
+                  <div className="h-2 rounded-full bg-gray-200 overflow-hidden">
+                    <div className="h-full w-2/3 animate-progress-bar bg-green-600" />
+                  </div>
+                </>
+              )}
+              {repoPhase === "done" && (
+                <div className="text-xs text-green-700 font-medium">
+                  Completed ✓ {repoTotal !== null && `(${repoSuccess}/${repoTotal} succeeded)`}
+                </div>
+              )}
+              {repoPhase === "error" && (
+                <div className="text-xs text-red-700 font-medium">Failed. See toast for details.</div>
+              )}
+            </div>
+          )}
+
+          {(repoPhase === "processing" || repoPhase === "done") && items.length > 0 && (
+            <div className="rounded border border-gray-200 bg-white">
+              <div className="px-3 py-2 border-b border-gray-200 text-xs text-gray-600">
+                Ingestion timeline
+              </div>
+              <div className="max-h-64 overflow-auto divide-y divide-gray-100">
+                {items.map((it) => (
+                  <div key={it.fileName} className="px-3 py-2 text-sm flex items-center justify-between">
+                    <div className="min-w-0">
+                      <div className="flex items-center gap-2">
+                        <span
+                          className={`inline-flex h-5 w-5 items-center justify-center rounded-full text-xs ${
+                            it.status === "done"
+                              ? "bg-green-600 text-white"
+                              : it.status === "error"
+                              ? "bg-red-600 text-white"
+                              : it.status === "processing"
+                              ? "bg-blue-600 text-white animate-pulse"
+                              : "bg-gray-300 text-gray-700"
+                          }`}
+                          title={it.status}
+                        >
+                          {it.status === "done" ? "✓" : it.status === "error" ? "!" : it.index ?? "…"}
+                        </span>
+                        <span className="font-medium text-gray-900 truncate">{it.serverName ?? "…"}</span>
+                        <span className="text-gray-500 truncate">({it.fileName})</span>
+                      </div>
+                      {it.status === "done" && (
+                        <div className="text-xs text-gray-600 ml-7">
+                          run {it.runId ?? "—"} · endpoints {it.endpoints ?? 0} · tasks {it.tasks ?? 0}
+                        </div>
+                      )}
+                      {it.status === "error" && it.message && (
+                        <div className="text-xs text-red-700 ml-7">{it.message}</div>
+                      )}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+        </div>
+      </div>
+    );
+  }
+
+  // Specialized Metrics Log card
+  function MetricsLogCard() {
+    const [fileName, setFileName] = useState("");
+    const [isDragging, setIsDragging] = useState(false);
+
+    return (
+      <div
+        className={`relative bg-white border rounded p-6 transition-all ${
+          isDragging ? "border-green-500 border-2 shadow-lg" : "border-gray-200 hover:border-gray-300"
+        }`}
+        onDragOver={(e) => {
+          e.preventDefault();
+          setIsDragging(true);
+        }}
+        onDragLeave={() => setIsDragging(false)}
+        onDrop={(e) => {
+          e.preventDefault();
+          setIsDragging(false);
+          const file = e.dataTransfer.files[0];
+          if (file && metricsFileRef.current) {
+            const dt = new DataTransfer();
+            dt.items.add(file);
+            metricsFileRef.current.files = dt.files;
+            setFileName(file.name);
+          }
+        }}
+      >
+        <div className="flex items-start gap-4 mb-4">
+          <div className="h-12 w-12 rounded bg-gray-100 grid place-items-center text-2xl flex-shrink-0">📈</div>
+          <div className="flex-1 min-w-0">
+            <h3 className="text-base font-semibold text-gray-900 mb-1">Metrics Log (TSV)</h3>
+            <p className="text-sm text-gray-600">
+              Per-Replicate server metrics; matched by{" "}
+              <code className="text-xs bg-gray-100 px-1 py-0.5 rounded">taskID</code> (Task UUID).
+            </p>
+          </div>
+        </div>
+
+        <div className="space-y-3">
+          <select
+            className="w-full rounded border border-gray-300 bg-white px-3 h-10 text-sm text-gray-700 focus:outline-none focus:ring-2 focus:ring-green-500 focus:border-transparent"
+            value={metricsServerName}
+            onChange={(e) => setMetricsServerName(e.target.value)}
+          >
+            <option value="">Select server…</option>
+            {servers.map((s) => (
+              <option key={s.server_id} value={s.server_name}>
+                {s.server_name}
+              </option>
+            ))}
+          </select>
+
+          <input
+            ref={metricsFileRef}
+            type="file"
+            className="hidden"
+            accept=".tsv,.txt"
+            onChange={(e) => setFileName(e.target.files?.[0]?.name || "")}
+          />
+          <button
+            onClick={() => metricsFileRef.current?.click()}
+            className="w-full rounded border border-gray-300 bg-white hover:bg-gray-50 px-4 h-10 text-sm text-gray-700 font-medium transition-colors"
+          >
+            {fileName ? `✓ ${fileName}` : "Choose File"}
+          </button>
+          <button
+            onClick={handleUploadMetricsLog}
+            disabled={!customerName || busy || metricsPhase === "uploading" || metricsPhase === "processing"}
+            className="w-full rounded bg-green-600 hover:bg-green-700 disabled:bg-gray-300 disabled:cursor-not-allowed px-4 h-10 text-sm text-white font-semibold transition-colors"
+          >
+            {metricsPhase === "uploading" || metricsPhase === "processing" ? "Processing…" : "Upload & Process"}
+          </button>
+
+          {metricsPhase !== "idle" && (
+            <div className="rounded bg-gray-50 border border-gray-200 p-3 space-y-2">
+              {metricsPhase === "uploading" && (
+                <>
+                  <div className="text-xs text-gray-700 font-medium">Uploading… {metricsUploadPct ?? 0}%</div>
+                  <div className="h-2 rounded-full bg-gray-200 overflow-hidden">
+                    <div className="h-full bg-green-600 transition-all" style={{ width: `${metricsUploadPct ?? 0}%` }} />
+                  </div>
+                </>
+              )}
+              {metricsPhase === "processing" && (
+                <>
+                  <div className="text-xs text-gray-700 font-medium">Processing on server…</div>
+                  <div className="h-2 rounded-full bg-gray-200 overflow-hidden">
+                    <div className="h-full w-2/3 animate-progress-bar bg-green-600" />
+                  </div>
+                </>
+              )}
+              {metricsPhase === "done" && <div className="text-xs text-green-700 font-medium">Completed ✓</div>}
+              {metricsPhase === "error" && (
+                <div className="text-xs text-red-700 font-medium">Failed. See toast for details.</div>
+              )}
+            </div>
+          )}
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="mx-auto max-w-[1400px] px-6 py-8">
@@ -1671,20 +1464,8 @@ function ReplicateTab() {
             </div>
 
             <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-              <RepositoryUploadCard
-                customerSelected={!!customerName}
-                repoFileRef={repoFileRef}
-                repoPhase={repoPhase}
-                repoPct={repoPct}
-                repoTotal={repoTotal}
-                repoItems={repoItems}
-                onUpload={handleUploadRepoJsonOrZip}
-                onStopStream={clearRepoSse}
-                getInsightsStatusForRunId={(runId) => getInsightsStatus(runId)}
-                onOpenInsightsForRun={(runId) => openInsights(runId)}
-              />
+              <RepositoryUploadCard />
               <UploadCard
-                customerSelected={!!customerName}
                 title="QEM Servers (TSV)"
                 icon="🔗"
                 description="Map ServerName to repository server names"
@@ -1695,7 +1476,6 @@ function ReplicateTab() {
                 pct={qemServersPct}
               />
               <UploadCard
-                customerSelected={!!customerName}
                 title="QEM Metrics (TSV)"
                 icon="📊"
                 description="Upload the AEM Tasks export. Required columns (any order): State, Server, Task, Server Type, Source Name, Source Type, Target Name, Target Type."
@@ -1706,7 +1486,6 @@ function ReplicateTab() {
                 pct={qemPct}
               />
               <UploadCard
-                customerSelected={!!customerName}
                 title="Replicate Task Log"
                 icon="🔐"
                 description="Any one task log is fine; we'll parse license entitlements from it"
@@ -1716,84 +1495,7 @@ function ReplicateTab() {
                 phase={licensePhase}
                 pct={licensePct}
               />
-              <MetricsLogCard
-                customerSelected={!!customerName}
-                servers={servers}
-                metricsServerName={metricsServerName}
-                setMetricsServerName={setMetricsServerName}
-                metricsFileRef={metricsFileRef}
-                onUpload={handleUploadMetricsLog}
-                metricsPhase={metricsPhase}
-                metricsUploadPct={metricsUploadPct}
-              />
-            </div>
-          </div>
-
-          {/* AI Insights (manual start) */}
-          <div className="mt-4 rounded border border-gray-200 bg-white p-5">
-            <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
-              <div>
-                <div className="flex items-center gap-2">
-                  <div className="text-sm font-semibold text-gray-900">AI Insights</div>
-                  <span className="inline-flex items-center rounded-full border border-amber-200 bg-amber-50 px-2 py-0.5 text-[11px] font-semibold text-amber-900">
-                    Preview · In development
-                  </span>
-                </div>
-                <div className="text-xs text-gray-600">
-                  This is a preview experience and is still under active development; workflow and output may change.
-                </div>
-              </div>
-
-              <div className="flex flex-wrap items-center gap-2">
-                <select
-                  className="rounded border border-gray-300 bg-white px-3 h-9 text-sm text-gray-900"
-                  value={insightsRunId ?? ""}
-                  onChange={(e) => setInsightsRunId(e.target.value ? Number(e.target.value) : null)}
-                >
-                  <option value="">Select run…</option>
-                  {insightRunOptions.map((o) => (
-                    <option key={o.runId} value={o.runId}>
-                      {o.label}
-                    </option>
-                  ))}
-                </select>
-
-                <InsightsChip
-                  status={insightsRunId ? getInsightsStatus(insightsRunId) ?? "created" : null}
-                  onClick={() => {
-                    if (insightsRunId) openInsights(insightsRunId);
-                  }}
-                />
-
-                <button
-                  type="button"
-                  onClick={() => insightsRunId && startInsights(insightsRunId)}
-                  disabled={!insightsRunId || insightsLoading}
-                  className="rounded bg-slate-900 px-3 py-2 text-xs font-semibold text-white disabled:bg-gray-300 disabled:cursor-not-allowed"
-                >
-                  Start
-                </button>
-
-                <button
-                  type="button"
-                  onClick={() => insightsRunId && retryInsights(insightsRunId)}
-                  disabled={!insightsRunId || insightsLoading || getInsightsStatus(insightsRunId) !== "failed"}
-                  className="rounded border px-3 py-2 text-xs font-semibold disabled:bg-gray-100 disabled:text-gray-400 disabled:cursor-not-allowed"
-                >
-                  Retry
-                </button>
-
-                <button
-                  type="button"
-                  onClick={() => {
-                    if (insightsRunId) openInsights(insightsRunId);
-                  }}
-                  disabled={!insightsRunId}
-                  className="rounded border px-3 py-2 text-xs font-semibold disabled:bg-gray-100 disabled:text-gray-400 disabled:cursor-not-allowed"
-                >
-                  View
-                </button>
-              </div>
+              <MetricsLogCard />
             </div>
           </div>
 
@@ -2107,33 +1809,6 @@ function ReplicateTab() {
           </div>
         </div>
       )}
-
-
-      {/* AI Insights modal */}
-      <InsightsModal
-        open={insightsOpen}
-        onClose={() => setInsightsOpen(false)}
-        job={insightsRunId ? (insightsByRunId[insightsRunId]?.job ?? null) : null}
-        automation={insightsRunId ? (insightsByRunId[insightsRunId]?.automation ?? null) : null}
-        data={(() => {
-          if (!insightsRunId) return null;
-          const cur = insightsByRunId[insightsRunId];
-          // Tolerate small variations in backend response shape
-          return (
-            cur?.result?.result_json ??
-            cur?.result?.insights_json ??
-            cur?.result_json ??
-            cur?.insights_json ??
-            (cur?.result ?? null)
-          );
-        })()}
-        onStart={() => {
-          if (insightsRunId) startInsights(insightsRunId);
-        }}
-        onRetry={() => {
-          if (insightsRunId) retryInsights(insightsRunId);
-        }}
-      />
 
       {/* Export & Delete overlays */}
       <LoaderOverlay

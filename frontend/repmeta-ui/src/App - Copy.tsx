@@ -1,4 +1,4 @@
-import type { KeyboardEvent } from "react";
+import type { KeyboardEvent, ReactNode, RefObject } from "react";
 import { memo, useEffect, useMemo, useRef, useState } from "react";
 import QlikSenseTab from "./QlikSenseTab"; // <- keep side-by-side with this file
 import TalendTab from "./TalendTab"; // <- new Talend tab
@@ -191,36 +191,29 @@ function LoaderOverlay({
   );
 }
 
-
-
 /* =========================
-   ENTERPRISE-STABLE UPLOAD CARDS
-   (Module-scope + memoized to avoid file-input remount/reset)
+   REPLICATE TAB (original)
    ========================= */
+
+
+/** =========================
+ *  Upload cards (module-scope)
+ *  Why: prevents <input type="file"> selection resets caused by component remounts when ReplicateTab re-renders
+ *  ========================= */
 
 type UploadCardProps = {
   title: string;
-  icon: string;
+  icon: ReactNode;
   description: string;
-  fileRef: { current: HTMLInputElement | null };
+  fileRef: RefObject<HTMLInputElement>;
   accept: string;
-  onUpload: () => void;
+  onUpload: () => void | Promise<void>;
   phase: Phase;
-  pct?: number | null;
-  customerSelected: boolean;
+  pct: number | null;
+  canUpload?: boolean;
 };
 
-const UploadCard = memo(function UploadCard({
-  title,
-  icon,
-  description,
-  fileRef,
-  accept,
-  onUpload,
-  phase,
-  pct,
-  customerSelected,
-}: UploadCardProps) {
+const UploadCard = memo(function UploadCard({ title, icon, description, fileRef, accept, onUpload, phase, pct, canUpload }: UploadCardProps) {
   const [fileName, setFileName] = useState("");
   const [isDragging, setIsDragging] = useState(false);
 
@@ -239,9 +232,14 @@ const UploadCard = memo(function UploadCard({
         setIsDragging(false);
         const file = e.dataTransfer.files?.[0];
         if (file && fileRef.current) {
-          const dt = new DataTransfer();
-          dt.items.add(file);
-          fileRef.current.files = dt.files;
+          try {
+            const dt = new DataTransfer();
+            dt.items.add(file);
+            // Some browsers restrict programmatic assignment; if blocked, user can still use the Choose File button
+            try {
+              fileRef.current.files = dt.files;
+            } catch {}
+          } catch {}
           setFileName(file.name);
         }
       }}
@@ -264,7 +262,6 @@ const UploadCard = memo(function UploadCard({
         />
 
         <button
-          type="button"
           onClick={() => fileRef.current?.click()}
           className="w-full rounded border border-gray-300 bg-white hover:bg-gray-50 px-4 h-10 text-sm text-gray-700 font-medium transition-colors"
         >
@@ -272,9 +269,8 @@ const UploadCard = memo(function UploadCard({
         </button>
 
         <button
-          type="button"
           onClick={onUpload}
-          disabled={!customerSelected || phase === "uploading" || phase === "processing"}
+          disabled={!(canUpload ?? true) || phase === "uploading" || phase === "processing"}
           className="w-full rounded bg-green-600 hover:bg-green-700 disabled:bg-gray-300 disabled:cursor-not-allowed px-4 h-10 text-sm text-white font-semibold transition-colors"
         >
           {phase === "uploading" || phase === "processing" ? "Processing…" : "Upload & Process"}
@@ -308,38 +304,46 @@ const UploadCard = memo(function UploadCard({
 });
 
 type RepositoryUploadCardProps = {
-  customerSelected: boolean;
-  repoFileRef: { current: HTMLInputElement | null };
+  customerName: string;
+  repoFileRef: RefObject<HTMLInputElement>;
   repoPhase: Phase;
   repoPct: number | null;
+  repoJobId: string | null;
   repoTotal: number | null;
+  repoSuccess: number;
+  repoFailed: number;
   repoItems: Record<string, RepoFileItem>;
-  onUpload: () => void;
+  onUpload: () => void | Promise<void>;
   onStopStream: () => void;
-  getInsightsStatusForRunId?: (runId: number) => string | null | undefined;
-  onOpenInsightsForRun?: (runId: number) => void;
+  getInsightStatus: (runId: number) => string | undefined;
+  onOpenInsights: (runId: number) => void;
 };
 
 const RepositoryUploadCard = memo(function RepositoryUploadCard({
-  customerSelected,
+  customerName,
   repoFileRef,
   repoPhase,
   repoPct,
+  repoJobId,
   repoTotal,
+  repoSuccess,
+  repoFailed,
   repoItems,
   onUpload,
   onStopStream,
-  getInsightsStatusForRunId,
-  onOpenInsightsForRun,
+  getInsightStatus,
+  onOpenInsights,
 }: RepositoryUploadCardProps) {
   const [fileName, setFileName] = useState("");
   const [isDragging, setIsDragging] = useState(false);
 
-  const items = Object.values(repoItems).sort((a, b) => {
-    const ai = a.index ?? 0;
-    const bi = b.index ?? 0;
-    return ai - bi || a.fileName.localeCompare(b.fileName);
-  });
+  const items = useMemo(() => {
+    return Object.values(repoItems).sort((a, b) => {
+      const ai = a.index ?? 0;
+      const bi = b.index ?? 0;
+      return ai - bi || a.fileName.localeCompare(b.fileName);
+    });
+  }, [repoItems]);
 
   const total = repoTotal ?? (fileName ? 1 : 0);
   const doneCount = items.filter((i) => i.status === "done").length;
@@ -360,9 +364,13 @@ const RepositoryUploadCard = memo(function RepositoryUploadCard({
         setIsDragging(false);
         const file = e.dataTransfer.files?.[0];
         if (file && repoFileRef.current) {
-          const dt = new DataTransfer();
-          dt.items.add(file);
-          repoFileRef.current.files = dt.files;
+          try {
+            const dt = new DataTransfer();
+            dt.items.add(file);
+            try {
+              repoFileRef.current.files = dt.files;
+            } catch {}
+          } catch {}
           setFileName(file.name);
         }
       }}
@@ -372,8 +380,8 @@ const RepositoryUploadCard = memo(function RepositoryUploadCard({
         <div className="flex-1 min-w-0">
           <h3 className="text-base font-semibold text-gray-900 mb-1">Repository JSON / ZIP</h3>
           <p className="text-sm text-gray-600">
-            Upload a single repository <span className="font-medium">JSON</span> or a <span className="font-medium">ZIP</span>
-            containing multiple JSONs (one per Replicate server). We’ll unpack, ingest each, and stream per-server status.
+            Upload a single repository <span className="font-medium">JSON</span> or a <span className="font-medium">ZIP</span> containing multiple JSONs (one per Replicate server). We'll
+            unpack, ingest each, and stream per-server status.
           </p>
         </div>
       </div>
@@ -388,31 +396,30 @@ const RepositoryUploadCard = memo(function RepositoryUploadCard({
         />
 
         <button
-          type="button"
           onClick={() => repoFileRef.current?.click()}
           className="w-full rounded border border-gray-300 bg-white hover:bg-gray-50 px-4 h-10 text-sm text-gray-700 font-medium transition-colors"
         >
           {fileName ? `✓ ${fileName}` : "Choose JSON or ZIP"}
         </button>
 
-        <div className="flex gap-3">
+        <div className="grid grid-cols-2 gap-2">
           <button
-            type="button"
             onClick={onUpload}
-            disabled={!customerSelected || repoPhase === "uploading" || repoPhase === "processing"}
-            className="flex-1 rounded bg-green-600 hover:bg-green-700 disabled:bg-gray-300 disabled:cursor-not-allowed px-4 h-10 text-sm text-white font-semibold transition-colors"
+            disabled={!customerName || repoPhase === "uploading" || repoPhase === "processing"}
+            className="rounded bg-green-600 hover:bg-green-700 disabled:bg-gray-300 disabled:cursor-not-allowed px-4 h-10 text-sm text-white font-semibold transition-colors"
           >
             {repoPhase === "uploading" || repoPhase === "processing" ? "Processing…" : "Upload & Process"}
           </button>
 
-          <button
-            type="button"
-            onClick={onStopStream}
-            disabled={repoPhase !== "processing"}
-            className="flex-1 rounded border border-gray-300 bg-white hover:bg-gray-50 disabled:bg-gray-100 disabled:text-gray-400 disabled:cursor-not-allowed px-4 h-10 text-sm text-gray-700 font-semibold transition-colors"
-          >
-            Stop Stream
-          </button>
+          {repoJobId && (repoPhase === "processing" || repoPhase === "done") && (
+            <button
+              onClick={onStopStream}
+              className="rounded border border-gray-300 bg-white hover:bg-gray-50 px-4 h-10 text-sm text-gray-700 font-medium transition-colors"
+              title="Stop listening to stream (does not cancel backend job)"
+            >
+              Stop Stream
+            </button>
+          )}
         </div>
 
         {repoPhase !== "idle" && (
@@ -427,7 +434,17 @@ const RepositoryUploadCard = memo(function RepositoryUploadCard({
             )}
             {repoPhase === "processing" && (
               <>
-                <div className="text-xs text-gray-700 font-medium">Streaming ingest status…</div>
+                <div className="flex items-center justify-between">
+                  <div className="text-xs text-gray-700 font-medium">
+                    Processing on server… {total ? <span className="text-gray-600">({doneCount + errCount}/{total} completed)</span> : null}
+                  </div>
+                  {(repoSuccess > 0 || repoFailed > 0) && (
+                    <div className="text-xs text-gray-700">
+                      <span className="text-green-700 font-medium">{repoSuccess} ok</span>{" "}
+                      {repoFailed > 0 && <span className="text-red-700 font-medium">· {repoFailed} failed</span>}
+                    </div>
+                  )}
+                </div>
                 <div className="h-2 rounded-full bg-gray-200 overflow-hidden">
                   <div className="h-full w-2/3 animate-progress-bar bg-green-600" />
                 </div>
@@ -435,61 +452,51 @@ const RepositoryUploadCard = memo(function RepositoryUploadCard({
             )}
             {repoPhase === "done" && (
               <div className="text-xs text-green-700 font-medium">
-                Completed ✓ ({doneCount}/{total} succeeded{errCount ? `, ${errCount} failed` : ""})
+                Completed ✓ {repoTotal !== null && `(${repoSuccess}/${repoTotal} succeeded)`}
               </div>
             )}
             {repoPhase === "error" && <div className="text-xs text-red-700 font-medium">Failed. See toast for details.</div>}
           </div>
         )}
 
-        {items.length > 0 && (
+        {(repoPhase === "processing" || repoPhase === "done") && items.length > 0 && (
           <div className="rounded border border-gray-200 bg-white">
-            <div className="px-3 py-2 text-xs font-semibold text-gray-600 uppercase tracking-wide border-b">
-              Ingestion timeline
-            </div>
+            <div className="px-3 py-2 border-b border-gray-200 text-xs text-gray-600">Ingestion timeline</div>
             <div className="max-h-64 overflow-auto divide-y divide-gray-100">
-              {items.map((it) => {
-                const status = typeof it.runId === "number" && getInsightsStatusForRunId ? getInsightsStatusForRunId(it.runId) : null;
-                return (
-                  <div key={it.fileName} className="px-3 py-2 text-sm flex items-center justify-between gap-3">
-                    <div className="min-w-0">
-                      <div className="flex items-center gap-2">
-                        <span
-                          className={`inline-flex h-5 w-5 items-center justify-center rounded-full text-xs ${
-                            it.status === "done"
-                              ? "bg-green-600 text-white"
-                              : it.status === "error"
-                              ? "bg-red-600 text-white"
-                              : it.status === "processing"
-                              ? "bg-blue-600 text-white animate-pulse"
-                              : "bg-gray-300 text-gray-700"
-                          }`}
-                          title={it.status}
-                        >
-                          {it.status === "done" ? "✓" : it.status === "error" ? "!" : it.index ?? "…"}
-                        </span>
-                        <span className="font-medium text-gray-900 truncate">{it.serverName ?? "…"}</span>
-                        <span className="text-gray-500 truncate">({it.fileName})</span>
-                      </div>
-                      {it.status === "done" && (
-                        <div className="text-xs text-gray-600 ml-7">
-                          run {it.runId ?? "—"} · endpoints {it.endpoints ?? 0} · tasks {it.tasks ?? 0}
-                        </div>
-                      )}
-                      {it.status === "error" && it.message && <div className="text-xs text-red-700 ml-7">{it.message}</div>}
+              {items.map((it) => (
+                <div key={it.fileName} className="px-3 py-2 text-sm flex items-center justify-between">
+                  <div className="min-w-0">
+                    <div className="flex items-center gap-2">
+                      <span
+                        className={`inline-flex h-5 w-5 items-center justify-center rounded-full text-xs ${
+                          it.status === "done"
+                            ? "bg-green-600 text-white"
+                            : it.status === "error"
+                            ? "bg-red-600 text-white"
+                            : it.status === "processing"
+                            ? "bg-blue-600 text-white animate-pulse"
+                            : "bg-gray-300 text-gray-700"
+                        }`}
+                        title={it.status}
+                      >
+                        {it.status === "done" ? "✓" : it.status === "error" ? "!" : it.index ?? "…"}
+                      </span>
+                      <span className="font-medium text-gray-900 truncate">{it.serverName ?? "…"}</span>
+                      <span className="text-gray-500 truncate">({it.fileName})</span>
                     </div>
-
-                    {typeof it.runId === "number" && onOpenInsightsForRun && (
-                      <div className="flex-shrink-0">
-                        <InsightsChip
-                          status={status ?? (it.status === "done" ? "created" : null)}
-                          onClick={() => onOpenInsightsForRun(it.runId!)}
-                        />
-                      </div>
+                    {it.status === "done" && (
+                      <div className="text-xs text-gray-600 ml-7">run {it.runId ?? "—"} · endpoints {it.endpoints ?? 0} · tasks {it.tasks ?? 0}</div>
                     )}
+                    {it.status === "error" && it.message && <div className="text-xs text-red-700 ml-7">{it.message}</div>}
                   </div>
-                );
-              })}
+
+                  <div className="ml-3 flex items-center gap-2 shrink-0">
+                    {it.status === "done" && typeof it.runId === "number" ? (
+                      <InsightsChip status={getInsightStatus(it.runId)} onClick={() => onOpenInsights(it.runId as number)} />
+                    ) : null}
+                  </div>
+                </div>
+              ))}
             </div>
           </div>
         )}
@@ -499,25 +506,25 @@ const RepositoryUploadCard = memo(function RepositoryUploadCard({
 });
 
 type MetricsLogCardProps = {
-  customerSelected: boolean;
-  servers: { server_id: number; server_name: string }[];
+  customerName: string;
+  servers: Server[];
   metricsServerName: string;
   setMetricsServerName: (v: string) => void;
-  metricsFileRef: { current: HTMLInputElement | null };
-  onUpload: () => void;
+  metricsFileRef: RefObject<HTMLInputElement>;
   metricsPhase: Phase;
-  metricsUploadPct?: number | null;
+  metricsUploadPct: number | null;
+  onUpload: () => void | Promise<void>;
 };
 
 const MetricsLogCard = memo(function MetricsLogCard({
-  customerSelected,
+  customerName,
   servers,
   metricsServerName,
   setMetricsServerName,
   metricsFileRef,
-  onUpload,
   metricsPhase,
   metricsUploadPct,
+  onUpload,
 }: MetricsLogCardProps) {
   const [fileName, setFileName] = useState("");
   const [isDragging, setIsDragging] = useState(false);
@@ -537,9 +544,13 @@ const MetricsLogCard = memo(function MetricsLogCard({
         setIsDragging(false);
         const file = e.dataTransfer.files?.[0];
         if (file && metricsFileRef.current) {
-          const dt = new DataTransfer();
-          dt.items.add(file);
-          metricsFileRef.current.files = dt.files;
+          try {
+            const dt = new DataTransfer();
+            dt.items.add(file);
+            try {
+              metricsFileRef.current.files = dt.files;
+            } catch {}
+          } catch {}
           setFileName(file.name);
         }
       }}
@@ -549,8 +560,7 @@ const MetricsLogCard = memo(function MetricsLogCard({
         <div className="flex-1 min-w-0">
           <h3 className="text-base font-semibold text-gray-900 mb-1">Metrics Log (TSV)</h3>
           <p className="text-sm text-gray-600">
-            Per-Replicate server metrics; matched by <code className="text-xs bg-gray-100 px-1 py-0.5 rounded">taskID</code>
-            (Task UUID).
+            Per-Replicate server metrics; matched by <code className="text-xs bg-gray-100 px-1 py-0.5 rounded">taskID</code> (Task UUID).
           </p>
         </div>
       </div>
@@ -576,9 +586,7 @@ const MetricsLogCard = memo(function MetricsLogCard({
           accept=".tsv,.txt"
           onChange={(e) => setFileName(e.target.files?.[0]?.name || "")}
         />
-
         <button
-          type="button"
           onClick={() => metricsFileRef.current?.click()}
           className="w-full rounded border border-gray-300 bg-white hover:bg-gray-50 px-4 h-10 text-sm text-gray-700 font-medium transition-colors"
         >
@@ -586,9 +594,8 @@ const MetricsLogCard = memo(function MetricsLogCard({
         </button>
 
         <button
-          type="button"
           onClick={onUpload}
-          disabled={!customerSelected || !metricsServerName || metricsPhase === "uploading" || metricsPhase === "processing"}
+          disabled={!customerName || metricsPhase === "uploading" || metricsPhase === "processing"}
           className="w-full rounded bg-green-600 hover:bg-green-700 disabled:bg-gray-300 disabled:cursor-not-allowed px-4 h-10 text-sm text-white font-semibold transition-colors"
         >
           {metricsPhase === "uploading" || metricsPhase === "processing" ? "Processing…" : "Upload & Process"}
@@ -621,9 +628,6 @@ const MetricsLogCard = memo(function MetricsLogCard({
   );
 });
 
-/* =========================
-   REPLICATE TAB (original)
-   ========================= */
 function ReplicateTab() {
   // data
   const [customers, setCustomers] = useState<Customer[]>([]);
@@ -679,139 +683,144 @@ function ReplicateTab() {
   const [repoSuccess, setRepoSuccess] = useState<number>(0);
   const [repoFailed, setRepoFailed] = useState<number>(0);
   const [repoItems, setRepoItems] = useState<Record<string, RepoFileItem>>({});
-  const repoEsRef = useRef<EventSource | null>(null);
-
 
   // =========================
   // AI Insights (Phase 1)
   // =========================
   const [insightsOpen, setInsightsOpen] = useState(false);
   const [insightsRunId, setInsightsRunId] = useState<number | null>(null);
+  const [insightsData, setInsightsData] = useState<any>(null);
   const [insightsLoading, setInsightsLoading] = useState(false);
   const [insightsByRunId, setInsightsByRunId] = useState<Record<number, any>>({});
-  const insightsByRunIdRef = useRef<Record<number, any>>({});
 
-  useEffect(() => {
-    insightsByRunIdRef.current = insightsByRunId;
-  }, [insightsByRunId]);
-
+  // Runs available for insights (completed repository ingests)
   const insightRunOptions = useMemo(() => {
     return Object.values(repoItems)
       .filter((it) => it.status === "done" && typeof it.runId === "number")
       .map((it) => ({
         runId: it.runId as number,
-        label: `${(it.serverName || it.fileName).slice(0, 24)} (run ${it.runId})`,
+        label: `${it.serverName ?? it.fileName} (run ${it.runId})`,
       }))
       .sort((a, b) => b.runId - a.runId);
   }, [repoItems]);
 
+  // Default to the newest run once available (do NOT auto-start generation)
   useEffect(() => {
     if (!insightsRunId && insightRunOptions.length > 0) {
       setInsightsRunId(insightRunOptions[0].runId);
     }
-  }, [insightsRunId, insightRunOptions]);
+  }, [insightRunOptions, insightsRunId]);
 
-  function getInsightsStatus(runId: number): string | null {
-    const r = insightsByRunIdRef.current[runId];
-    return (r?.job?.status as string) ?? null;
-  }
 
   async function fetchInsights(runId: number) {
-    const res = await fetch(`${API_BASE}/api/runs/${runId}/insights`);
-    if (!res.ok) {
-      // If not found yet, treat as not started.
-      return { job: { status: "created" }, result: null, automation: null };
-    }
-    return await res.json();
-  }
-
-  async function refreshInsights(runId: number) {
-    const data = await fetchInsights(runId);
-    // Only update state if something material changed (prevents rerender churn)
-    setInsightsByRunId((prev) => {
-      const before = prev[runId];
-      const sigBefore = JSON.stringify({
-        s: before?.job?.status,
-        u: before?.job?.updated_at,
-        a: before?.automation?.execution_id,
-        as: before?.automation?.status,
-      });
-      const sigAfter = JSON.stringify({
-        s: data?.job?.status,
-        u: data?.job?.updated_at,
-        a: data?.automation?.execution_id,
-        as: data?.automation?.status,
-      });
-      if (sigBefore === sigAfter) return prev;
-      return { ...prev, [runId]: data };
-    });
-    return data;
+    return await fetchJson<any>(`${API_BASE}/api/runs/${runId}/insights`);
   }
 
   async function startInsights(runId: number) {
-    setInsightsLoading(true);
-    try {
-      const res = await fetch(`${API_BASE}/api/runs/${runId}/insights/start`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ requested_by: "ui" }),
-      });
-      if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
-      await refreshInsights(runId);
-      toast("AI insights started.", "ok");
-    } catch (e: any) {
-      toast(`Start insights failed: ${e.message}`, "err");
-    } finally {
-      setInsightsLoading(false);
-    }
+    await fetchJson<any>(`${API_BASE}/api/runs/${runId}/insights/start`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ requested_by: "ui" }),
+    });
+    const d = await fetchInsights(runId);
+    setInsightsData(d);
+    setInsightsByRunId((prev) => ({ ...prev, [runId]: d }));
+    return d;
   }
 
   async function retryInsights(runId: number) {
+    await fetchJson<any>(`${API_BASE}/api/runs/${runId}/insights/retry`, {
+      method: "POST",
+    });
+    const d = await fetchInsights(runId);
+    setInsightsData(d);
+    setInsightsByRunId((prev) => ({ ...prev, [runId]: d }));
+    return d;
+  }
+
+  async function openInsights(runId: number) {
+    setInsightsRunId(runId);
+    setInsightsOpen(true);
+
+    // Use cached snapshot immediately (if available) for snappy UI
+    const cached = insightsByRunId[runId];
+    if (cached) setInsightsData(cached);
+
     setInsightsLoading(true);
     try {
-      const res = await fetch(`${API_BASE}/api/runs/${runId}/insights/retry`, { method: "POST" });
-      if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
-      await refreshInsights(runId);
-      toast("AI insights retry requested.", "ok");
+      const d = await fetchInsights(runId);
+      setInsightsData(d);
+      setInsightsByRunId((prev) => ({ ...prev, [runId]: d }));
     } catch (e: any) {
-      toast(`Retry insights failed: ${e.message}`, "err");
+      toast(`Failed to load insights: ${e?.message ?? e}`, "err");
     } finally {
       setInsightsLoading(false);
     }
   }
 
-  function openInsights(runId: number) {
-    setInsightsRunId(runId);
-    setInsightsOpen(true);
-    void refreshInsights(runId);
-  }
 
-  // Controlled polling: only while modal is open OR job is pending/running
+  // Adaptive polling for the selected run only (prevents high-frequency re-renders that reset file selections)
   useEffect(() => {
-    let timer: any = null;
+    if (!insightsRunId) return;
+
     let cancelled = false;
+    let timer: number | null = null;
 
-    async function tick() {
-      if (!insightsRunId) return;
-      const status = getInsightsStatus(insightsRunId) || "created";
-      const shouldPoll = insightsOpen || status === "pending" || status === "running";
-      if (!shouldPoll) return;
+    const schedule = (ms: number) => {
+      if (timer) window.clearTimeout(timer);
+      timer = window.setTimeout(() => void tick(), ms);
+    };
 
-      const intervalMs = insightsOpen ? 2500 : 7000;
+    const isTerminal = (st: string | undefined) => st === "succeeded" || st === "failed";
+
+    const tick = async () => {
+      if (cancelled) return;
       try {
-        await refreshInsights(insightsRunId);
-      } catch {
-        // ignore
-      }
-      if (!cancelled) timer = setTimeout(tick, intervalMs);
-    }
+        const d = await fetchInsights(insightsRunId);
+        if (cancelled) return;
 
+        // Only update state when something materially changes (status / automation)
+        setInsightsByRunId((prev) => {
+          const prevD = prev[insightsRunId];
+          const prevStatus = prevD?.job?.status;
+          const nextStatus = d?.job?.status;
+          const prevExec = prevD?.automation?.execution_id;
+          const nextExec = d?.automation?.execution_id;
+          const prevAuto = prevD?.automation?.status;
+          const nextAuto = d?.automation?.status;
+
+          if (prevStatus === nextStatus && prevExec === nextExec && prevAuto === nextAuto) return prev;
+          return { ...prev, [insightsRunId]: d };
+        });
+
+        if (insightsOpen) setInsightsData(d);
+
+        const st = d?.job?.status;
+        if (isTerminal(st) && !insightsOpen) {
+          // Stop polling when modal is closed and job is terminal
+          return;
+        }
+
+        // Poll faster only while actively running or modal is open; otherwise back off.
+        const delay = insightsOpen ? 2000 : st === "running" || st === "pending" ? 3000 : 12000;
+        schedule(delay);
+      } catch {
+        // Backoff on transient failures
+        schedule(insightsOpen ? 4000 : 20000);
+      }
+    };
+
+    // Initial tick
     void tick();
+
     return () => {
       cancelled = true;
-      if (timer) clearTimeout(timer);
+      if (timer) window.clearTimeout(timer);
     };
   }, [insightsRunId, insightsOpen]);
+
+
+  const repoEsRef = useRef<EventSource | null>(null);
 
   const [qemServersPhase, setQemServersPhase] = useState<Phase>("idle");
   const [qemServersPct, setQemServersPct] = useState<number | null>(null);
@@ -1052,7 +1061,6 @@ function ReplicateTab() {
     clearRepoSse();
 
     try {
-      setBusy(true);
       setRepoPhase("idle");
       setRepoPct(0);
 
@@ -1105,11 +1113,8 @@ function ReplicateTab() {
               endpoints: (payload as any).endpoints,
               tasks: (payload as any).tasks,
             });
-            const rid = (payload as any).runId as any;
-            if (typeof rid === "number") {
-              // Prefetch once so chips/status are available without polling storms
-              void refreshInsights(rid);
-            }
+            // Insights are created on the backend when run_id exists, but generation is manual for the demo.
+            // Use the Insights chip to open the modal and click Start after QEM/Metrics ingests are complete.
           }
 
           if (t === "error") {
@@ -1156,7 +1161,6 @@ function ReplicateTab() {
       toast(`Repo ingest failed: ${e.message}`, "err");
       clearRepoSse();
     } finally {
-      setBusy(false);
       if (repoFileRef.current) repoFileRef.current.value = "";
     }
   }
@@ -1406,7 +1410,288 @@ function ReplicateTab() {
     }
   }
 
-  // (metrics log card moved to module scope)
+  function RepositoryUploadCard() {
+    const [fileName, setFileName] = useState("");
+    const [isDragging, setIsDragging] = useState(false);
+
+    const items = Object.values(repoItems).sort((a, b) => {
+      const ai = a.index ?? 0;
+      const bi = b.index ?? 0;
+      return ai - bi || a.fileName.localeCompare(b.fileName);
+    });
+
+    const total = repoTotal ?? (fileName ? 1 : 0);
+    const doneCount = items.filter((i) => i.status === "done").length;
+    const errCount = items.filter((i) => i.status === "error").length;
+
+    return (
+      <div
+        className={`relative bg-white border rounded p-6 transition-all ${
+          isDragging ? "border-green-500 border-2 shadow-lg" : "border-gray-200 hover:border-gray-300"
+        }`}
+        onDragOver={(e) => {
+          e.preventDefault();
+          setIsDragging(true);
+        }}
+        onDragLeave={() => setIsDragging(false)}
+        onDrop={(e) => {
+          e.preventDefault();
+          setIsDragging(false);
+          const file = e.dataTransfer.files[0];
+          if (file && repoFileRef.current) {
+            const dt = new DataTransfer();
+            dt.items.add(file);
+            repoFileRef.current.files = dt.files;
+            setFileName(file.name);
+          }
+        }}
+      >
+        <div className="flex items-start gap-4 mb-4">
+          <div className="h-12 w-12 rounded bg-gray-100 grid place-items-center text-2xl flex-shrink-0">📋</div>
+          <div className="flex-1 min-w-0">
+            <h3 className="text-base font-semibold text-gray-900 mb-1">Repository JSON / ZIP</h3>
+            <p className="text-sm text-gray-600">
+              Upload a single repository <span className="font-medium">JSON</span> or a{" "}
+              <span className="font-medium">ZIP</span> containing multiple JSONs (one per Replicate server). We’ll
+              unpack, ingest each, and stream per-server status.
+            </p>
+          </div>
+        </div>
+
+        <div className="space-y-3">
+          <input
+            ref={repoFileRef}
+            type="file"
+            className="hidden"
+            accept=".json,.zip"
+            onChange={(e) => setFileName(e.target.files?.[0]?.name || "")}
+          />
+
+          <button
+            onClick={() => repoFileRef.current?.click()}
+            className="w-full rounded border border-gray-300 bg-white hover:bg-gray-50 px-4 h-10 text-sm text-gray-700 font-medium transition-colors"
+          >
+            {fileName ? `✓ ${fileName}` : "Choose JSON or ZIP"}
+          </button>
+
+          <div className="grid grid-cols-2 gap-2">
+            <button
+              onClick={handleUploadRepoJsonOrZip}
+              disabled={!customerName || repoPhase === "uploading" || repoPhase === "processing"}
+              className="rounded bg-green-600 hover:bg-green-700 disabled:bg-gray-300 disabled:cursor-not-allowed px-4 h-10 text-sm text-white font-semibold transition-colors"
+            >
+              {repoPhase === "uploading" || repoPhase === "processing" ? "Processing…" : "Upload & Process"}
+            </button>
+            {repoJobId && (repoPhase === "processing" || repoPhase === "done") && (
+              <button
+                onClick={clearRepoSse}
+                className="rounded border border-gray-300 bg-white hover:bg-gray-50 px-4 h-10 text-sm text-gray-700 font-medium transition-colors"
+                title="Stop listening to stream (does not cancel backend job)"
+              >
+                Stop Stream
+              </button>
+            )}
+          </div>
+
+          {repoPhase !== "idle" && (
+            <div className="rounded bg-gray-50 border border-gray-200 p-3 space-y-2">
+              {repoPhase === "uploading" && (
+                <>
+                  <div className="text-xs text-gray-700 font-medium">Uploading… {repoPct ?? 0}%</div>
+                  <div className="h-2 rounded-full bg-gray-200 overflow-hidden">
+                    <div className="h-full bg-green-600 transition-all" style={{ width: `${repoPct ?? 0}%` }} />
+                  </div>
+                </>
+              )}
+              {repoPhase === "processing" && (
+                <>
+                  <div className="flex items-center justify-between">
+                    <div className="text-xs text-gray-700 font-medium">
+                      Processing on server…{" "}
+                      {total ? (
+                        <span className="text-gray-600">
+                          ({doneCount + errCount}/{total} completed)
+                        </span>
+                      ) : null}
+                    </div>
+                    {(repoSuccess > 0 || repoFailed > 0) && (
+                      <div className="text-xs text-gray-700">
+                        <span className="text-green-700 font-medium">{repoSuccess} ok</span>{" "}
+                        {repoFailed > 0 && (
+                          <span className="text-red-700 font-medium">· {repoFailed} failed</span>
+                        )}
+                      </div>
+                    )}
+                  </div>
+                  <div className="h-2 rounded-full bg-gray-200 overflow-hidden">
+                    <div className="h-full w-2/3 animate-progress-bar bg-green-600" />
+                  </div>
+                </>
+              )}
+              {repoPhase === "done" && (
+                <div className="text-xs text-green-700 font-medium">
+                  Completed ✓ {repoTotal !== null && `(${repoSuccess}/${repoTotal} succeeded)`}
+                </div>
+              )}
+              {repoPhase === "error" && (
+                <div className="text-xs text-red-700 font-medium">Failed. See toast for details.</div>
+              )}
+            </div>
+          )}
+
+          {(repoPhase === "processing" || repoPhase === "done") && items.length > 0 && (
+            <div className="rounded border border-gray-200 bg-white">
+              <div className="px-3 py-2 border-b border-gray-200 text-xs text-gray-600">
+                Ingestion timeline
+              </div>
+              <div className="max-h-64 overflow-auto divide-y divide-gray-100">
+                {items.map((it) => (
+                  <div key={it.fileName} className="px-3 py-2 text-sm flex items-center justify-between">
+                    <div className="min-w-0">
+                      <div className="flex items-center gap-2">
+                        <span
+                          className={`inline-flex h-5 w-5 items-center justify-center rounded-full text-xs ${
+                            it.status === "done"
+                              ? "bg-green-600 text-white"
+                              : it.status === "error"
+                              ? "bg-red-600 text-white"
+                              : it.status === "processing"
+                              ? "bg-blue-600 text-white animate-pulse"
+                              : "bg-gray-300 text-gray-700"
+                          }`}
+                          title={it.status}
+                        >
+                          {it.status === "done" ? "✓" : it.status === "error" ? "!" : it.index ?? "…"}
+                        </span>
+                        <span className="font-medium text-gray-900 truncate">{it.serverName ?? "…"}</span>
+                        <span className="text-gray-500 truncate">({it.fileName})</span>
+                      </div>
+                      {it.status === "done" && (
+                        <div className="text-xs text-gray-600 ml-7">
+                          run {it.runId ?? "—"} · endpoints {it.endpoints ?? 0} · tasks {it.tasks ?? 0}
+                        </div>
+                      )}
+                      {it.status === "error" && it.message && (
+                        <div className="text-xs text-red-700 ml-7">{it.message}</div>
+                      )}
+                    </div>
+
+                    <div className="ml-3 flex items-center gap-2 shrink-0">
+                      {it.status === "done" && typeof it.runId === "number" ? (
+                        <>
+                          <InsightsChip
+                            status={insightsByRunId[it.runId]?.job?.status}
+                            onClick={() => openInsights(it.runId as number)}
+                          />
+                        </>
+                      ) : null}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+        </div>
+      </div>
+    );
+  }
+
+  return (
+      <div
+        className={`relative bg-white border rounded p-6 transition-all ${
+          isDragging ? "border-green-500 border-2 shadow-lg" : "border-gray-200 hover:border-gray-300"
+        }`}
+        onDragOver={(e) => {
+          e.preventDefault();
+          setIsDragging(true);
+        }}
+        onDragLeave={() => setIsDragging(false)}
+        onDrop={(e) => {
+          e.preventDefault();
+          setIsDragging(false);
+          const file = e.dataTransfer.files[0];
+          if (file && metricsFileRef.current) {
+            const dt = new DataTransfer();
+            dt.items.add(file);
+            metricsFileRef.current.files = dt.files;
+            setFileName(file.name);
+          }
+        }}
+      >
+        <div className="flex items-start gap-4 mb-4">
+          <div className="h-12 w-12 rounded bg-gray-100 grid place-items-center text-2xl flex-shrink-0">📈</div>
+          <div className="flex-1 min-w-0">
+            <h3 className="text-base font-semibold text-gray-900 mb-1">Metrics Log (TSV)</h3>
+            <p className="text-sm text-gray-600">
+              Per-Replicate server metrics; matched by{" "}
+              <code className="text-xs bg-gray-100 px-1 py-0.5 rounded">taskID</code> (Task UUID).
+            </p>
+          </div>
+        </div>
+
+        <div className="space-y-3">
+          <select
+            className="w-full rounded border border-gray-300 bg-white px-3 h-10 text-sm text-gray-700 focus:outline-none focus:ring-2 focus:ring-green-500 focus:border-transparent"
+            value={metricsServerName}
+            onChange={(e) => setMetricsServerName(e.target.value)}
+          >
+            <option value="">Select server…</option>
+            {servers.map((s) => (
+              <option key={s.server_id} value={s.server_name}>
+                {s.server_name}
+              </option>
+            ))}
+          </select>
+
+          <input
+            ref={metricsFileRef}
+            type="file"
+            className="hidden"
+            accept=".tsv,.txt"
+            onChange={(e) => setFileName(e.target.files?.[0]?.name || "")}
+          />
+          <button
+            onClick={() => metricsFileRef.current?.click()}
+            className="w-full rounded border border-gray-300 bg-white hover:bg-gray-50 px-4 h-10 text-sm text-gray-700 font-medium transition-colors"
+          >
+            {fileName ? `✓ ${fileName}` : "Choose File"}
+          </button>
+          <button
+            onClick={handleUploadMetricsLog}
+            disabled={!customerName || metricsPhase === "uploading" || metricsPhase === "processing"}
+            className="w-full rounded bg-green-600 hover:bg-green-700 disabled:bg-gray-300 disabled:cursor-not-allowed px-4 h-10 text-sm text-white font-semibold transition-colors"
+          >
+            {metricsPhase === "uploading" || metricsPhase === "processing" ? "Processing…" : "Upload & Process"}
+          </button>
+
+          {metricsPhase !== "idle" && (
+            <div className="rounded bg-gray-50 border border-gray-200 p-3 space-y-2">
+              {metricsPhase === "uploading" && (
+                <>
+                  <div className="text-xs text-gray-700 font-medium">Uploading… {metricsUploadPct ?? 0}%</div>
+                  <div className="h-2 rounded-full bg-gray-200 overflow-hidden">
+                    <div className="h-full bg-green-600 transition-all" style={{ width: `${metricsUploadPct ?? 0}%` }} />
+                  </div>
+                </>
+              )}
+              {metricsPhase === "processing" && (
+                <>
+                  <div className="text-xs text-gray-700 font-medium">Processing on server…</div>
+                  <div className="h-2 rounded-full bg-gray-200 overflow-hidden">
+                    <div className="h-full w-2/3 animate-progress-bar bg-green-600" />
+                  </div>
+                </>
+              )}
+              {metricsPhase === "done" && <div className="text-xs text-green-700 font-medium">Completed ✓</div>}
+              {metricsPhase === "error" && (
+                <div className="text-xs text-red-700 font-medium">Failed. See toast for details.</div>
+              )}
+            </div>
+          )}
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="mx-auto max-w-[1400px] px-6 py-8">
@@ -1513,6 +1798,104 @@ function ReplicateTab() {
                   </div>
                 </div>
               )}
+
+              {/* AI Insights */}
+              <div className="rounded border border-gray-200 bg-white p-4">
+                <div className="flex items-start justify-between gap-3">
+                  <div className="min-w-0">
+                    <div className="text-xs font-semibold text-gray-700 uppercase tracking-wide">AI Insights</div>
+                    <div className="text-xs text-gray-500 mt-1">
+                      Run after Repository + QEM + Metrics. Select a run and click Start.
+                    </div>
+                  </div>
+
+                  <div className="shrink-0">
+                    <InsightsChip
+                      status={insightsRunId ? insightsByRunId[insightsRunId]?.job?.status : undefined}
+                      onClick={() => {
+                        if (insightsRunId) openInsights(insightsRunId);
+                      }}
+                    />
+                  </div>
+                </div>
+
+                <div className="mt-3 space-y-2">
+                  <label className="text-xs font-medium text-gray-700">Run</label>
+                  <select
+                    className="w-full h-10 rounded border border-gray-300 bg-white px-3 text-sm"
+                    value={insightsRunId ?? ""}
+                    onChange={(e) => setInsightsRunId(e.target.value ? Number(e.target.value) : null)}
+                  >
+                    <option value="" disabled>
+                      Select an ingested run…
+                    </option>
+                    {insightRunOptions.map((o) => (
+                      <option key={o.runId} value={o.runId}>
+                        {o.label}
+                      </option>
+                    ))}
+                  </select>
+
+                  <div className="flex gap-2">
+                    <button
+                      className="flex-1 h-10 rounded bg-slate-900 text-white text-sm font-semibold disabled:opacity-40"
+                      disabled={
+                        !insightsRunId ||
+                        (() => {
+                          const st = insightsByRunId[insightsRunId]?.job?.status;
+                          // Allow start when not started ("created"/undefined) or after failure.
+                          if (!st || st === "created" || st === "failed") return false;
+                          return true;
+                        })()
+                      }
+                      onClick={() => {
+                        if (!insightsRunId) return;
+                        void startInsights(insightsRunId);
+                      }}
+                      title="Start AI insights generation for the selected run"
+                    >
+                      Start
+                    </button>
+
+                    <button
+                      className="flex-1 h-10 rounded border border-gray-300 bg-white text-sm font-semibold disabled:opacity-40"
+                      disabled={!insightsRunId || insightsByRunId[insightsRunId]?.job?.status !== "failed"}
+                      onClick={() => {
+                        if (!insightsRunId) return;
+                        void retryInsights(insightsRunId);
+                      }}
+                      title="Retry AI insights generation for the selected run"
+                    >
+                      Retry
+                    </button>
+
+                    <button
+                      className="flex-1 h-10 rounded border border-gray-300 bg-white text-sm font-semibold disabled:opacity-40"
+                      disabled={!insightsRunId}
+                      onClick={() => {
+                        if (!insightsRunId) return;
+                        openInsights(insightsRunId);
+                      }}
+                      title="View insights details"
+                    >
+                      View
+                    </button>
+                  </div>
+
+                  {insightsRunId && insightsByRunId[insightsRunId]?.automation?.execution_id && (
+                    <div className="text-xs text-gray-500">
+                      n8n:{" "}
+                      <span className="font-medium text-gray-700">
+                        {insightsByRunId[insightsRunId]?.automation?.execution_id}
+                      </span>
+                      {insightsByRunId[insightsRunId]?.automation?.status ? (
+                        <> · {insightsByRunId[insightsRunId]?.automation?.status}</>
+                      ) : null}
+                    </div>
+                  )}
+                </div>
+              </div>
+
             </div>
           </div>
         </div>
@@ -1672,19 +2055,21 @@ function ReplicateTab() {
 
             <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
               <RepositoryUploadCard
-                customerSelected={!!customerName}
+                customerName={customerName}
                 repoFileRef={repoFileRef}
                 repoPhase={repoPhase}
                 repoPct={repoPct}
+                repoJobId={repoJobId}
                 repoTotal={repoTotal}
+                repoSuccess={repoSuccess}
+                repoFailed={repoFailed}
                 repoItems={repoItems}
                 onUpload={handleUploadRepoJsonOrZip}
                 onStopStream={clearRepoSse}
-                getInsightsStatusForRunId={(runId) => getInsightsStatus(runId)}
-                onOpenInsightsForRun={(runId) => openInsights(runId)}
+                getInsightStatus={(runId) => insightsByRunId[runId]?.job?.status}
+                onOpenInsights={(runId) => openInsights(runId)}
               />
               <UploadCard
-                customerSelected={!!customerName}
                 title="QEM Servers (TSV)"
                 icon="🔗"
                 description="Map ServerName to repository server names"
@@ -1693,9 +2078,9 @@ function ReplicateTab() {
                 onUpload={handleUploadQemServersTsv}
                 phase={qemServersPhase}
                 pct={qemServersPct}
+                canUpload={!!customerName}
               />
               <UploadCard
-                customerSelected={!!customerName}
                 title="QEM Metrics (TSV)"
                 icon="📊"
                 description="Upload the AEM Tasks export. Required columns (any order): State, Server, Task, Server Type, Source Name, Source Type, Target Name, Target Type."
@@ -1704,9 +2089,9 @@ function ReplicateTab() {
                 onUpload={handleUploadQemTsv}
                 phase={qemPhase}
                 pct={qemPct}
+                canUpload={!!customerName}
               />
               <UploadCard
-                customerSelected={!!customerName}
                 title="Replicate Task Log"
                 icon="🔐"
                 description="Any one task log is fine; we'll parse license entitlements from it"
@@ -1715,85 +2100,18 @@ function ReplicateTab() {
                 onUpload={handleUploadLicenseLog}
                 phase={licensePhase}
                 pct={licensePct}
+                canUpload={!!customerName}
               />
               <MetricsLogCard
-                customerSelected={!!customerName}
+                customerName={customerName}
                 servers={servers}
                 metricsServerName={metricsServerName}
                 setMetricsServerName={setMetricsServerName}
                 metricsFileRef={metricsFileRef}
-                onUpload={handleUploadMetricsLog}
                 metricsPhase={metricsPhase}
                 metricsUploadPct={metricsUploadPct}
+                onUpload={handleUploadMetricsLog}
               />
-            </div>
-          </div>
-
-          {/* AI Insights (manual start) */}
-          <div className="mt-4 rounded border border-gray-200 bg-white p-5">
-            <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
-              <div>
-                <div className="flex items-center gap-2">
-                  <div className="text-sm font-semibold text-gray-900">AI Insights</div>
-                  <span className="inline-flex items-center rounded-full border border-amber-200 bg-amber-50 px-2 py-0.5 text-[11px] font-semibold text-amber-900">
-                    Preview · In development
-                  </span>
-                </div>
-                <div className="text-xs text-gray-600">
-                  This is a preview experience and is still under active development; workflow and output may change.
-                </div>
-              </div>
-
-              <div className="flex flex-wrap items-center gap-2">
-                <select
-                  className="rounded border border-gray-300 bg-white px-3 h-9 text-sm text-gray-900"
-                  value={insightsRunId ?? ""}
-                  onChange={(e) => setInsightsRunId(e.target.value ? Number(e.target.value) : null)}
-                >
-                  <option value="">Select run…</option>
-                  {insightRunOptions.map((o) => (
-                    <option key={o.runId} value={o.runId}>
-                      {o.label}
-                    </option>
-                  ))}
-                </select>
-
-                <InsightsChip
-                  status={insightsRunId ? getInsightsStatus(insightsRunId) ?? "created" : null}
-                  onClick={() => {
-                    if (insightsRunId) openInsights(insightsRunId);
-                  }}
-                />
-
-                <button
-                  type="button"
-                  onClick={() => insightsRunId && startInsights(insightsRunId)}
-                  disabled={!insightsRunId || insightsLoading}
-                  className="rounded bg-slate-900 px-3 py-2 text-xs font-semibold text-white disabled:bg-gray-300 disabled:cursor-not-allowed"
-                >
-                  Start
-                </button>
-
-                <button
-                  type="button"
-                  onClick={() => insightsRunId && retryInsights(insightsRunId)}
-                  disabled={!insightsRunId || insightsLoading || getInsightsStatus(insightsRunId) !== "failed"}
-                  className="rounded border px-3 py-2 text-xs font-semibold disabled:bg-gray-100 disabled:text-gray-400 disabled:cursor-not-allowed"
-                >
-                  Retry
-                </button>
-
-                <button
-                  type="button"
-                  onClick={() => {
-                    if (insightsRunId) openInsights(insightsRunId);
-                  }}
-                  disabled={!insightsRunId}
-                  className="rounded border px-3 py-2 text-xs font-semibold disabled:bg-gray-100 disabled:text-gray-400 disabled:cursor-not-allowed"
-                >
-                  View
-                </button>
-              </div>
             </div>
           </div>
 
@@ -2108,33 +2426,6 @@ function ReplicateTab() {
         </div>
       )}
 
-
-      {/* AI Insights modal */}
-      <InsightsModal
-        open={insightsOpen}
-        onClose={() => setInsightsOpen(false)}
-        job={insightsRunId ? (insightsByRunId[insightsRunId]?.job ?? null) : null}
-        automation={insightsRunId ? (insightsByRunId[insightsRunId]?.automation ?? null) : null}
-        data={(() => {
-          if (!insightsRunId) return null;
-          const cur = insightsByRunId[insightsRunId];
-          // Tolerate small variations in backend response shape
-          return (
-            cur?.result?.result_json ??
-            cur?.result?.insights_json ??
-            cur?.result_json ??
-            cur?.insights_json ??
-            (cur?.result ?? null)
-          );
-        })()}
-        onStart={() => {
-          if (insightsRunId) startInsights(insightsRunId);
-        }}
-        onRetry={() => {
-          if (insightsRunId) retryInsights(insightsRunId);
-        }}
-      />
-
       {/* Export & Delete overlays */}
       <LoaderOverlay
         show={exporting}
@@ -2146,6 +2437,20 @@ function ReplicateTab() {
         title="Deleting data…"
         subtitle="Purging all ingested data for this customer. This may take a minute."
         icon="🧹"
+      />
+
+      <InsightsModal
+        open={insightsOpen}
+        onClose={() => setInsightsOpen(false)}
+        data={insightsData}
+        job={insightsData?.job}
+        automation={insightsData?.automation}
+        onStart={async () => {
+          if (insightsRunId) await startInsights(insightsRunId);
+        }}
+        onRetry={async () => {
+          if (insightsRunId) await retryInsights(insightsRunId);
+        }}
       />
 
       {/* Local animations */}

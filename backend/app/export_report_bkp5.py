@@ -65,180 +65,15 @@ def _apply_global_styles(doc):
         pass
 
 
-def _apply_header_footer(
-    doc,
-    customer_name: str = "",
-    generated_at: "datetime|None" = None,
-    footer_left: str = "Confidential — Customer Use Only",
-    show_page_number_on_first_page: bool = False,
-):
-    """
-    Professional header/footer with dynamic Word fields:
-      - Header (pages 2+): document title (left) and customer (right)
-      - Footer (pages 2+): confidentiality (left), customer + generated timestamp (center), Page X of Y (right)
-      - First page can optionally suppress page numbering (typical consultancy cover-page behavior)
-
-    Design goals:
-      - Avoid hard-coded page counts
-      - Avoid layout overflow: use tab stops instead of wide footer tables
-      - Be resilient if document/section properties are unavailable
-    """
-    try:
-        # Local imports to avoid hard dependency at module import time
-        from docx.shared import Inches, Pt
-        from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_TAB_ALIGNMENT
-        from docx.oxml import OxmlElement
-        from docx.oxml.ns import qn
-
-        section = doc.sections[0]
-
-        # Enable separate first-page header/footer (cover page)
-        try:
-            section.different_first_page_header_footer = True
-        except Exception:
-            pass
-
-        # Derive available text width (page width - margins)
-        try:
-            avail = section.page_width - section.left_margin - section.right_margin
-            avail_in = max(4.5, float(avail.inches) - 0.05)
-        except Exception:
-            avail_in = 6.5
-
-        # Timestamp formatting
-        try:
-            if generated_at is None:
-                from datetime import datetime, timezone
-                generated_at = datetime.now(timezone.utc)
-            # Normalize to UTC if tz-aware
-            try:
-                ts = generated_at.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-            except Exception:
-                ts = str(generated_at)
-        except Exception:
-            ts = ""
-
-        center_text = ""
-        if customer_name:
-            center_text = f"{customer_name}"
-        if ts:
-            center_text = f"{center_text} | Generated {ts}" if center_text else f"Generated {ts}"
-
-        def _wipe_paragraphs(container):
-            try:
-                for p in list(container.paragraphs):
-                    p._element.getparent().remove(p._element)
-            except Exception:
-                pass
-
-        def _add_fld_simple(paragraph, instr: str):
-            # <w:fldSimple w:instr="PAGE"><w:r><w:t>1</w:t></w:r></w:fldSimple>
-            fld = OxmlElement("w:fldSimple")
-            fld.set(qn("w:instr"), instr)
-            r = OxmlElement("w:r")
-            t = OxmlElement("w:t")
-            t.text = "1"
-            r.append(t)
-            fld.append(r)
-            paragraph._p.append(fld)
-
-        def _set_tabs(p, include_center: bool = True):
-            try:
-                ts_ = p.paragraph_format.tab_stops
-                ts_.clear_all()
-                if include_center:
-                    ts_.add_tab_stop(Inches(avail_in / 2), alignment=WD_TAB_ALIGNMENT.CENTER)
-                ts_.add_tab_stop(Inches(avail_in), alignment=WD_TAB_ALIGNMENT.RIGHT)
-            except Exception:
-                pass
-
-        # ---------------- Standard header (pages 2+) ----------------
-        try:
-            hdr = section.header
-            if hdr:
-                # Append a small info line; do not wipe the header so branding banners/logos remain.
-                p = hdr.add_paragraph()
-                _set_tabs(p, include_center=False)
-                p.paragraph_format.space_before = Pt(0)
-                p.paragraph_format.space_after = Pt(0)
-                run_l = p.add_run("Customer Technical Overview — Qlik Replicate")
-                run_l.font.size = Pt(8)
-                run_l.bold = True
-                p.add_run("\t")
-                run_r = p.add_run(customer_name or "")
-                run_r.font.size = Pt(8)
-                p.alignment = WD_ALIGN_PARAGRAPH.LEFT
-        except Exception:
-            pass
-
-        # ---------------- First-page header (cover) ----------------
-        # Keep first-page header minimal; branding banner/logo (if any) is handled elsewhere.
-        try:
-            hdr1 = getattr(section, "first_page_header", None)
-            if hdr1:
-                # Do not wipe; allow branding to populate it.
-                pass
-        except Exception:
-            pass
-
-        # ---------------- Standard footer (pages 2+) ----------------
-        try:
-            ftr = section.footer
-            if ftr:
-                _wipe_paragraphs(ftr)
-                p = ftr.add_paragraph()
-                _set_tabs(p, include_center=True)
-                p.paragraph_format.space_before = Pt(0)
-                p.paragraph_format.space_after = Pt(0)
-
-                run_l = p.add_run(footer_left)
-                run_l.font.size = Pt(8)
-
-                p.add_run("\t")
-                run_c = p.add_run(center_text)
-                run_c.font.size = Pt(8)
-
-                p.add_run("\t")
-                _add_fld_simple(p, "PAGE")
-                p.add_run(" of ")
-                _add_fld_simple(p, "NUMPAGES")
-
-                p.alignment = WD_ALIGN_PARAGRAPH.LEFT
-        except Exception:
-            pass
-
-        # ---------------- First-page footer (cover) ----------------
-        try:
-            ftr1 = getattr(section, "first_page_footer", None)
-            if ftr1:
-                _wipe_paragraphs(ftr1)
-                p = ftr1.add_paragraph()
-                p.paragraph_format.space_before = Pt(0)
-                p.paragraph_format.space_after = Pt(0)
-                run = p.add_run(footer_left)
-                run.font.size = Pt(8)
-                if show_page_number_on_first_page:
-                    p.add_run("    ")
-                    _add_fld_simple(p, "PAGE")
-                    p.add_run(" of ")
-                    _add_fld_simple(p, "NUMPAGES")
-                    p.alignment = WD_ALIGN_PARAGRAPH.RIGHT
-                else:
-                    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-        except Exception:
-            pass
-
-    except Exception:
-        # Never block report generation due to header/footer formatting
-        pass
-
-
-# Backward-compatible alias for older call sites (kept intentionally)
 def _apply_footer(doc, footer_text: str = "Confidential — Customer Use Only"):
+    """Adds 'Page X of Y' and optional left text; graceful if styles missing."""
     try:
-        _apply_header_footer(doc, customer_name="", generated_at=None, footer_left=footer_text)
-    except Exception:
-        pass
+        section = doc.sections[0]
+        footer = section.footer
+        p = footer.paragraphs[0] if footer.paragraphs else footer.add_paragraph()
+        if footer_text:
+            run_left = p.add_run(footer_text + "    ")
+            run_left.font.size = Pt(8)
 
         def _add_field(run, instr):
             fld = OxmlElement("w:fldSimple")
@@ -784,118 +619,6 @@ def _add_title(doc: Document, text: str):
     r.font.size = Pt(24)
     p.alignment = WD_ALIGN_PARAGRAPH.LEFT
     return p
-
-def _add_cover_banner(
-    doc: Document,
-    title: str,
-    customer_name: str,
-    subtitle: str = "Qlik Replicate",
-    generated_at: "datetime|None" = None,
-):
-    """
-    Polished cover banner with a Qlik-green accent.
-    Keeps layout within the text area and works without external image assets.
-    """
-    try:
-        from docx.shared import Pt, RGBColor
-        from docx.enum.text import WD_ALIGN_PARAGRAPH
-        from docx.oxml.ns import qn
-        from docx.oxml import OxmlElement
-        from datetime import datetime, timezone
-
-        if generated_at is None:
-            generated_at = datetime.now(timezone.utc)
-
-        # Compute available text width dynamically
-        try:
-            section = doc.sections[0]
-            avail = section.page_width - section.left_margin - section.right_margin
-            total_w_in = max(4.5, float(avail.inches) - 0.15)
-        except Exception:
-            total_w_in = 6.5
-
-        # Banner table (1x1) with shading
-        t = doc.add_table(rows=1, cols=1)
-        t.autofit = False
-        try:
-            t.style = "Table Normal"
-        except Exception:
-            pass
-
-        # Fixed layout + explicit table width
-        try:
-            tbl = t._tbl
-            tblPr = tbl.tblPr
-            tblW = tblPr.find(qn("w:tblW"))
-            if tblW is None:
-                tblW = OxmlElement("w:tblW")
-                tblPr.append(tblW)
-            tblW.set(qn("w:w"), str(int(total_w_in * 1440)))
-            tblW.set(qn("w:type"), "dxa")
-
-            layout = tblPr.find(qn("w:tblLayout"))
-            if layout is None:
-                layout = OxmlElement("w:tblLayout")
-                tblPr.append(layout)
-            layout.set(qn("w:type"), "fixed")
-        except Exception:
-            pass
-
-        # Set cell width and shading
-        cell = t.rows[0].cells[0]
-        try:
-            cell.width = int(total_w_in * 1440)
-        except Exception:
-            pass
-        try:
-            _set_cell_shading(cell, "009845")  # Qlik green touch
-        except Exception:
-            pass
-
-        # Clear any default paragraph content
-        try:
-            cell.text = ""
-        except Exception:
-            pass
-
-        # Content
-        def _add_line(text, size, bold=False, italic=False, space_after=0):
-            p = cell.add_paragraph()
-            p.alignment = WD_ALIGN_PARAGRAPH.LEFT
-            p.paragraph_format.space_before = Pt(0)
-            p.paragraph_format.space_after = Pt(space_after)
-            r = p.add_run(text)
-            r.bold = bool(bold)
-            r.italic = bool(italic)
-            r.font.size = Pt(size)
-            r.font.color.rgb = RGBColor(255, 255, 255)
-            return p
-
-        _add_line(title, 28, bold=True, space_after=2)
-        if subtitle:
-            _add_line(subtitle, 12, bold=True, space_after=10)
-        if customer_name:
-            _add_line(customer_name, 22, bold=True, space_after=6)
-
-        # Generated timestamp (smaller, still white)
-        try:
-            ts = generated_at.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-        except Exception:
-            ts = str(generated_at)
-        _add_line(f"Generated {ts}", 10, italic=True, space_after=0)
-
-        # Slight spacing after banner
-        doc.add_paragraph()
-
-    except Exception:
-        # Never block report generation due to cover design
-        doc.add_paragraph(title)
-        if customer_name:
-            doc.add_paragraph(f"Customer: {customer_name}")
-        try:
-            doc.add_paragraph()
-        except Exception:
-            pass
 
 def _add_heading(doc: Document, text: str, level: int = 1):
     return doc.add_heading(text, level=level)
@@ -2005,25 +1728,20 @@ async def generate_summary_docx(customer_name: str, server_name: str) -> Tuple[b
         tgt_n = role_map.get("TARGET", 0)
 
         doc = Document()
-        generated_at = datetime.now(timezone.utc)
         try:
             _apply_global_styles(doc)
-        except Exception:
-            pass
-        # Ensure first-page header/footer is separate (cover page)
-        try:
-            doc.sections[0].different_first_page_header_footer = True
+            _apply_footer(doc)
         except Exception:
             pass
         try:
             _apply_branding(doc)
         except Exception:
             pass
-        try:
-            _apply_header_footer(doc, customer_name=customer_name, generated_at=generated_at)
-        except Exception:
-            pass
-    _add_cover_banner(doc, title="Qlik Replicate — Server Review", customer_name=customer_name, subtitle=f"Server: {server_name} | Run {run_id}", generated_at=generated_at)
+    _add_title(doc, "Qlik Replicate - Server Review")
+    _add_text(doc, f"Customer: {customer_name}", size=10)
+    _add_text(doc, f"Server: {server_name}", size=10)
+    _add_text(doc, f"Run ID: {run_id}", size=10)
+    doc.add_paragraph()
     _add_toc(doc)
     doc.add_page_break()
 
@@ -2934,26 +2652,19 @@ async def generate_customer_report_docx(customer_name: str, include_license: boo
 
     # ---------------- DOCX BUILD ----------------
         doc = Document()
-        generated_at = datetime.now(timezone.utc)
         try:
             _apply_global_styles(doc)
-        except Exception:
-            pass
-        # Ensure first-page header/footer is separate (cover page)
-        try:
-            doc.sections[0].different_first_page_header_footer = True
+            _apply_footer(doc)
         except Exception:
             pass
         try:
             _apply_branding(doc)
         except Exception:
             pass
-        try:
-            _apply_header_footer(doc, customer_name=customer_name, generated_at=generated_at)
-        except Exception:
-            pass
 
-    _add_cover_banner(doc, title="Customer Technical Overview", customer_name=customer_name, subtitle="Qlik Replicate — RepMeta", generated_at=generated_at)
+    _add_title(doc, "Customer Technical Overview")
+    _add_text(doc, f"Customer: {customer_name}", size=10)
+    doc.add_paragraph()
     _add_toc(doc)
     doc.add_page_break()
 
@@ -3590,30 +3301,15 @@ def _flapper_score_t90(t):
         return 0.0
 
 def _add_table_t90(doc, headers, rows):
-    """Table builder for T90 sections.
+    """Table builder for T90 sections with fixed layout and aligned columns.
 
-    Requirements:
-      - Keep the table strictly within the document text area (page width minus margins).
-      - Use fixed layout + explicit column widths so headers/values align predictably.
-      - Left-align the first (label) column; right-align numeric/time columns.
-
-    Notes:
-      - We compute available width from the document section at runtime rather than hard-coding.
-      - We insert zero-width break opportunities into long task tokens to prevent overflow.
+    Goal: ensure numeric columns (all except the first) are right-aligned for both headers and
+    values, and use fixed column widths so values visually sit under the correct header.
     """
     from docx.shared import Inches
     from docx.enum.text import WD_ALIGN_PARAGRAPH
-    from docx.enum.table import WD_TABLE_ALIGNMENT
     from docx.oxml import OxmlElement
     from docx.oxml.ns import qn
-
-    def _soft_wrap_token(s: str) -> str:
-        # Add invisible break opportunities after common separators used in task names.
-        # This reduces the risk of a long token forcing the table beyond the page width.
-        if s is None:
-            return ""
-        ss = str(s)
-        return ss.replace("_", "_\u200b").replace("-", "-\u200b")
 
     n = len(headers or [])
     t = doc.add_table(rows=1, cols=max(1, n))
@@ -3624,13 +3320,7 @@ def _add_table_t90(doc, headers, rows):
     except Exception:
         pass
 
-    # Center the table within the text area
-    try:
-        t.alignment = WD_TABLE_ALIGNMENT.CENTER
-    except Exception:
-        pass
-
-    # Fixed layout (avoid Word auto-resizing columns)
+    # Fixed layout (avoid Word auto-resizing columns in ways that make columns look misaligned)
     try:
         t.autofit = False
     except Exception:
@@ -3646,48 +3336,16 @@ def _add_table_t90(doc, headers, rows):
     except Exception:
         pass
 
-    # Compute available text width dynamically (page width - margins)
-    # Subtract a small fudge factor to account for table/cell padding and borders.
-    try:
-        section = doc.sections[0]
-        avail = section.page_width - section.left_margin - section.right_margin
-        total_w_in = max(4.5, float(avail.inches) - 0.15)
-    except Exception:
-        total_w_in = 6.5  # reasonable fallback for Letter with 1" margins
-
-    # Set explicit table width to the available text width (in twips)
-    try:
-        tbl = t._tbl
-        tblPr = tbl.tblPr
-        tblW = tblPr.find(qn("w:tblW"))
-        if tblW is None:
-            tblW = OxmlElement("w:tblW")
-            tblPr.append(tblW)
-        tblW.set(qn("w:type"), "dxa")
-        tblW.set(qn("w:w"), str(int(total_w_in * 1440)))  # twips per inch
-    except Exception:
-        pass
-
-    # Column widths (percentage-based; first column wider)
-    if n <= 1:
-        widths_in = [total_w_in]
-    else:
-        # More conservative first-column width for 5+ cols to avoid overflow
-        if n >= 6:
-            first_frac = 0.40
-        elif n == 5:
-            first_frac = 0.42
-        elif n == 4:
-            first_frac = 0.45
-        else:
-            first_frac = 0.50
-        first_w = total_w_in * first_frac
-        other_w = (total_w_in - first_w) / (n - 1)
-        widths_in = [first_w] + ([other_w] * (n - 1))
+    # Column widths (approx page text width ~6.5 inches). First column gets more space.
+    total_w = 6.5
+    first_frac = 0.45 if n >= 4 else 0.50
+    first_w = total_w * first_frac if n >= 1 else total_w
+    other_w = (total_w - first_w) / max(1, (n - 1)) if n > 1 else 0.0
+    widths = [first_w] + ([other_w] * max(0, n - 1))
 
     # Header row
     hdr_cells = t.rows[0].cells
-    for i, h in enumerate(headers or []):
+    for i, h in enumerate(headers):
         hdr_cells[i].text = str(h)
         _cell_bold(hdr_cells[i], 10)
         try:
@@ -3695,16 +3353,11 @@ def _add_table_t90(doc, headers, rows):
         except Exception:
             pass
 
-    # Apply widths: set both column width and cell widths for best Word compatibility
+    # Apply widths (set on every cell in the column to make Word respect it more consistently)
     try:
-        for i, w in enumerate(widths_in):
-            col_w = Inches(w)
-            try:
-                t.columns[i].width = col_w
-            except Exception:
-                pass
+        for i, w in enumerate(widths):
             for cell in t.columns[i].cells:
-                cell.width = col_w
+                cell.width = Inches(w)
     except Exception:
         pass
 
@@ -3718,16 +3371,14 @@ def _add_table_t90(doc, headers, rows):
 
         cells = t.add_row().cells
         for i, v in enumerate(vals):
-            if i == 0:
-                cells[i].text = _soft_wrap_token("" if v is None else str(v))
-            else:
-                cells[i].text = "" if v is None else str(v)
+            cells[i].text = "" if v is None else str(v)
             try:
                 cells[i].paragraphs[0].alignment = WD_ALIGN_PARAGRAPH.LEFT if i == 0 else WD_ALIGN_PARAGRAPH.RIGHT
             except Exception:
                 pass
 
     return t
+
 
 
 async def render_metricslog_90d_sections(doc, conn, customer_id: int, server_id: int, server_name: str):

@@ -751,11 +751,7 @@ function ReplicateTab() {
   async function startInsights(runId: number) {
     setInsightsLoading(true);
     try {
-      const res = await fetch(`${API_BASE}/api/runs/${runId}/insights/start`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ requested_by: "ui" }),
-      });
+      const res = await fetch(`${API_BASE}/api/runs/${runId}/insights/start`, { method: "POST" });
       if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
       await refreshInsights(runId);
       toast("AI insights started.", "ok");
@@ -1729,18 +1725,13 @@ function ReplicateTab() {
             </div>
           </div>
 
-          {/* AI Insights (manual start) */}
+          {/* AI Insights (manual start for demo) */}
           <div className="mt-4 rounded border border-gray-200 bg-white p-5">
             <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
               <div>
-                <div className="flex items-center gap-2">
-                  <div className="text-sm font-semibold text-gray-900">AI Insights</div>
-                  <span className="inline-flex items-center rounded-full border border-amber-200 bg-amber-50 px-2 py-0.5 text-[11px] font-semibold text-amber-900">
-                    Preview · In development
-                  </span>
-                </div>
+                <div className="text-sm font-semibold text-gray-900">AI Insights</div>
                 <div className="text-xs text-gray-600">
-                  This is a preview experience and is still under active development; workflow and output may change.
+                  Run after Repository + QEM + Metrics. Select a run and click Start (manual for demo).
                 </div>
               </div>
 

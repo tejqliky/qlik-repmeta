@@ -32,6 +32,9 @@ from .ingest import (
 
 from .license_routes import router as license_router  # license upload routes
 from .routes_talend import router as talend_router  # Talend staging & runs
+from .routes_ai_insights import router as ai_insights_router  # AI Insights API
+from .ai_insights import ensure_job_created, worker_loop  # AI job init + worker
+
 
 LOG = logging.getLogger("api")
 
@@ -54,6 +57,7 @@ app = FastAPI(title=API_TITLE, version=API_VERSION)
 # Register sub-routers
 app.include_router(license_router)
 app.include_router(talend_router, prefix="/talend")
+app.include_router(ai_insights_router)
 # IMPORTANT: expose Qlik Sense routes at ROOT (no '/api' prefix) for the new UI
 app.include_router(qliksense_router)
 
@@ -108,6 +112,33 @@ app.add_middleware(
     allow_headers=allow_headers,
     expose_headers=expose_headers,
 )
+
+
+# ---------------- AI Insights embedded worker (Demo-first; can be disabled) ----------------
+AI_WORKER_EMBEDDED = _parse_bool_env("AI_WORKER_EMBEDDED", True)
+
+@app.on_event("startup")
+async def _startup_ai_worker():
+    if not AI_WORKER_EMBEDDED:
+        log.info("AI worker embedded disabled (AI_WORKER_EMBEDDED=0)")
+        return
+    try:
+        stop_event = asyncio.Event()
+        app.state.ai_worker_stop_event = stop_event
+        app.state.ai_worker_task = asyncio.create_task(worker_loop(stop_event))
+        log.info("AI worker embedded started")
+    except Exception as e:
+        # Do not fail API startup for demo; log and continue.
+        log.exception("Failed to start embedded AI worker: %s", e)
+
+@app.on_event("shutdown")
+async def _shutdown_ai_worker():
+    stop_event = getattr(app.state, "ai_worker_stop_event", None)
+    if stop_event:
+        stop_event.set()
+    task = getattr(app.state, "ai_worker_task", None)
+    if task:
+        task.cancel()
 
 
 # ---------------- Models ----------------
@@ -293,6 +324,9 @@ async def ingest(body: IngestBody):
             customer_name=customer_name_eff,
             server_name=server_name_eff,
         )
+        # Create AI insight job record (LLM is NOT called here)
+        if result and result.get("run_id"):
+            await ensure_job_created(int(result["run_id"]))
         log.info("INGEST /ingest ok result=%s", {k: result.get(k) for k in ("run_id", "endpoints_inserted", "tasks_inserted")})
         return result
 
@@ -362,6 +396,9 @@ async def ingest_file(
             customer_name=customer_name_eff,
             server_name=server_name_eff,
         )
+        # Create AI insight job record (LLM is NOT called here)
+        if result and result.get("run_id"):
+            await ensure_job_created(int(result["run_id"]))
         return result
 
     except HTTPException:
@@ -456,6 +493,12 @@ async def _ingest_single_json_bytes(
 
     try:
         result = await ingest_repository(payload, customer_name, server)
+
+        # Create AI insight job record (LLM is NOT called here)
+
+        if result and result.get("run_id"):
+
+            await ensure_job_created(int(result["run_id"]))
         await _emit(job, {
             "type": "ingest_completed",
             "fileName": filename,
@@ -521,6 +564,15 @@ async def _run_repository_upload_job(job_id: str, data_bytes: bytes, filename: s
                         await _emit(js, {"type": "ingest_started", "fileName": name, "serverName": server})
 
                         res = await ingest_repository(payload, customer_name, server)
+
+
+                        # Create AI insight job record (LLM is NOT called here)
+
+
+                        if res and res.get("run_id"):
+
+
+                            await ensure_job_created(int(res["run_id"]))
                         results.append(res)
                         success += 1
 
